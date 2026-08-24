@@ -45,10 +45,31 @@ use the `PaddleOCR` pipeline class rather than the `TextDetection` /
 
 ```bash
 brew install tesseract          # binary, English only
-brew install tesseract-lang     # extra languages (chi_sim, etc.)
+brew install tesseract-lang     # all 126 language packs (~686 MB)
 
 .venv/bin/python tesseract_ocr.py --list
-.venv/bin/python tesseract_ocr.py image.png -l eng
+.venv/bin/python tesseract_ocr.py page.png --script latin   # any Latin-script language
+.venv/bin/python tesseract_ocr.py page.png -l pol           # better, if the language is known
+```
+
+#### European coverage
+
+`tesseract-lang` is one all-or-nothing bottle, so it installs every language.
+The European ones present: **44 Latin** (eng fra deu spa ita por nld dan swe nor
+fin isl pol ces slk slv hrv bos srp_latn hun ron lit lav est sqi mlt gle gla cym
+bre cat eus glg tur ltz fao oci cos epo lat frm enm ita_old spa_old), **6
+Cyrillic** (rus ukr bel bul srp mkd) and **2 Greek** (ell grc).
+
+Prefer `--script latin|cyrillic|greek` over chaining languages. One
+`script/Latin` pass reads Polish, Czech, Hungarian and Turkish without being
+told which; `-l pol+ces+hun+...` is slower *and* less accurate, because each
+added language widens the character set Tesseract must choose from. Verified
+character-exact, diacritics included:
+
+```
+Η γρήγορη καφέ αλεπού. Σύνολο: 1.284,50 ευρώ    [script/Greek]
+Быстрая коричневая лиса. Итого: 2 019,75 рублей  [script/Cyrillic]
+Zażółć gęślą jaźń. Suma: 3 145,08 złotych        [script/Latin]
 ```
 
 Writes plain text plus a TSV of per-word boxes and confidences to
@@ -172,6 +193,67 @@ perfect overlap would save the CPU's time, not halve the wall clock.
 
 ### Measured behaviour
 
+**`table_sample.png`** (English table) — all 22 values resolved correctly across
+repeated runs, no misses, no duplicates, no false separator flags.
+
+**`euro_table_sample.png`** (Polish/Greek, European number formats) — all 12
+table values correct, including `1.284,50`, `2 019,75` and `1 073,82` in the same
+document.
+
+**`demo.png`** (Chinese newspaper, no `chi_sim`) — every dispute is Tesseract
+reading Chinese as Latin and emitting garbage (`2024` -> `25`, `5000` ->
+`50002`). It loses every time, because its confidence lands at 0.03-0.38 while
+the other two agree at 1.00. A weak engine outside its competence does not need
+excluding by hand; low confidence demotes it.
+
+#### Why the vote is worth its cost
+
+The 4-bit VL model is not merely occasionally imprecise on digits — it fails
+*hard*, and not always the same way between runs, so a single pass cannot be
+trusted even at temperature 0. Errors caught so far, every one outvoted by
+PP-OCRv6 and Tesseract agreeing:
+
+| VL model read | Truth | Failure |
+|---|---|---|
+| `5548` @ **1.00** | `5548.39` | decimals dropped, *at full confidence* |
+| `486.48` @ 0.44 | `4486.48` | leading digit dropped |
+| `304.25` @ 0.54 | `3304.25` | leading digit dropped |
+| `2626926.24` @ 0.24 | `26926.24` | digits duplicated |
+| `111…1556.40111…` @ 0.27 | `1556.40` | degenerate repetition loop |
+
+The first row is the important one. A confidence threshold would have accepted
+it: the model was certain and wrong. Only disagreement caught it. The dropped
+leading digits at 0.44-0.54 are similarly awkward — moderate confidence is not a
+usable signal on its own.
+
+This is also the honest argument for not using the VL model alone on financial
+tables at 4-bit quantisation, whatever its prose quality.
+
+### Parallelism
+
+Layout detection runs once up front, then two lanes run concurrently on
+different hardware:
+
+- **GPU lane** — every VL call is HTTP to the MLX server process. Pure I/O in
+  this process, so it overlaps with CPU work rather than fighting for the GIL.
+- **CPU lane** — PP-OCRv6 detection/recognition and Tesseract.
+
+The CPU lane hands each numeric crop to the GPU *as it finds it*, so VL
+re-reads run while the CPU is still cropping later lines. Every Paddle
+predictor is confined to the single CPU-lane thread, because Paddle predictors
+are not thread-safe.
+
+The run reports its own overlap:
+
+```
+wall 41.8s | CPU busy 14.8s | GPU busy 25.7s | overlapped 5.7s
+```
+
+Note the honest ceiling: the GPU is the bottleneck here (25.7s vs 14.8s), so
+perfect overlap would save the CPU's time, not halve the wall clock.
+
+### Measured behaviour
+
 **`table_sample.png`** (English table, Tesseract fully capable) — all 22 table
 values resolved correctly, no duplicates, no misses. One dispute, and it is the
 case the whole design exists for:
@@ -199,3 +281,49 @@ since there is more CPU work to hide behind the GPU.
 
 If you routinely OCR CJK pages, either install `tesseract-lang` so its readings
 are meaningful, or drop `--w-tesseract` to 0 to skip the noise.
+
+### The limit of voting: shared failure modes
+
+Agreement between engines is strong evidence, but it is not proof. If all three
+make the *same* mistake, the vote reports unanimity and the audit looks clean.
+
+This showed up on `euro_table_sample.png`. The line reads
+`Wzrost 18,7% — Ανάπτυξη 42,3%`, and every engine dropped the decimal comma:
+
+```
+ppocr: 'Wzrost 18 7% — Avπτuξn 42 3%'
+```
+
+So `18,7` became two numbers, `18` and `7` — unanimously, at high confidence.
+The same page's table cells (`845,09`, `987,31`) were read correctly at the same
+font size, so this is specific to that mixed Polish/Greek line, not a
+resolution problem; padding the crop and upscaling 4x did not recover the comma.
+
+`hybrid_ocr.py` therefore flags it structurally rather than trusting agreement.
+A digit run separated from the next by only a space, where the next run is *not*
+a 3-digit group, is very likely a lost decimal separator:
+
+```
+N number(s) on lines where a decimal separator may have been lost --
+unanimity here is NOT confirmation:
+  [vision_footnote] ppocr read: 'Wzrost 18 7% — Avπτuξn 42 3%'
+```
+
+The check deliberately does not fire on real space-grouped thousands
+(`2 019,75`, `1 000 000,00`), which is why it tests the *length* of the
+following run rather than merely the presence of a space.
+
+Every resolution also carries the raw per-engine text in `numbers.json`, so a
+suspicious number can be diagnosed without re-running the page.
+
+### Number formats
+
+The normaliser decides which separator is decimal from evidence rather than an
+assumed locale: if both `.` and `,` appear, the last one is the decimal point;
+if only one appears, it groups thousands when it splits the digits into exact
+threes and is decimal otherwise. So `1,284.50`, `1.284,50` and `1 284,50` all
+become `1284.5`, and `42,3` becomes `42.3`.
+
+`1,284` is genuinely ambiguous (1284 or 1.284). The three-digit-group rule
+resolves it as thousands, which is the commoner intent in tabular data — but it
+is a choice, not a deduction.

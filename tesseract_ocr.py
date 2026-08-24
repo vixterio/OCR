@@ -10,12 +10,17 @@ Install (macOS):
     brew install tesseract-lang     # all extra language packs (~1.5 GB)
     .venv/bin/pip install pytesseract pillow
 
-Language packs are separate downloads. `--list` shows what you have; the
-default install is English only, so pass e.g. `-l chi_sim` only after
-installing tesseract-lang.
+Language packs are separate downloads; `--list` shows what you have.
+
+For European text prefer a *script* model over chaining languages. One
+`script/Latin` pass reads Polish, Czech, Hungarian, Turkish and the rest
+without being told which; `-l pol+ces+hun+...` is both slower and less
+accurate, because every added language widens the character set Tesseract has
+to choose from.
 
     .venv/bin/python tesseract_ocr.py --list
-    .venv/bin/python tesseract_ocr.py demo.png -l eng
+    .venv/bin/python tesseract_ocr.py page.png --script latin
+    .venv/bin/python tesseract_ocr.py page.png -l pol      # better, if known
 """
 import argparse
 import os
@@ -26,6 +31,20 @@ import pytesseract
 from PIL import Image
 
 OUT_DIR = "output/tesseract"
+
+# Script-level models: one model per writing system, covering every language in
+# it. These are the three European scripts.
+SCRIPTS = {"latin": "script/Latin", "cyrillic": "script/Cyrillic", "greek": "script/Greek"}
+
+# European languages by script, for --list. Codes only appear here if
+# tesseract-lang actually ships them.
+EUROPEAN = {
+    "Latin": ("eng fra deu spa ita por nld dan swe nor fin isl pol ces slk slv hrv bos "
+              "srp_latn hun ron lit lav est sqi mlt gle gla cym bre cat eus glg tur ltz "
+              "fao oci cos epo lat frm enm ita_old spa_old").split(),
+    "Cyrillic": "rus ukr bel bul srp mkd".split(),
+    "Greek": "ell grc".split(),
+}
 
 
 def resolve_binary():
@@ -43,7 +62,9 @@ def resolve_binary():
 def main():
     parser = argparse.ArgumentParser(description="Run Tesseract OCR on an image.")
     parser.add_argument("image", nargs="?", default="demo.png")
-    parser.add_argument("-l", "--lang", default="eng", help="language code(s), e.g. eng or eng+chi_sim")
+    parser.add_argument("-l", "--lang", default="eng", help="language code(s), e.g. eng or eng+fra")
+    parser.add_argument("--script", choices=sorted(SCRIPTS),
+                        help="use a whole-script model instead of named languages")
     parser.add_argument("--psm", default="3", help="page segmentation mode (3=auto, 6=block, 7=line)")
     parser.add_argument("--list", action="store_true", help="list installed languages and exit")
     args = parser.parse_args()
@@ -53,15 +74,28 @@ def main():
 
     langs = pytesseract.get_languages(config="")
     if args.list:
-        print("installed languages:", ", ".join(sorted(langs)))
+        print(f"{len(langs)} languages installed")
+        for script, codes in EUROPEAN.items():
+            have = [c for c in codes if c in langs]
+            missing = [c for c in codes if c not in langs]
+            print(f"\n  {script} ({len(have)}/{len(codes)}): {' '.join(have)}")
+            if missing:
+                print(f"    missing: {' '.join(missing)}")
+        print("\n  script models:", ", ".join(SCRIPTS.values()))
         return
 
-    for code in args.lang.split("+"):
-        if code not in langs:
-            sys.exit(
-                f"language {code!r} is not installed (have: {', '.join(sorted(langs))}).\n"
-                "Install the extra packs with: brew install tesseract-lang"
-            )
+    if args.script:
+        # Script models live in a subdirectory, so get_languages() never lists
+        # them; check the file instead of the language list.
+        args.lang = SCRIPTS[args.script]
+    else:
+        for code in args.lang.split("+"):
+            if code not in langs:
+                sys.exit(
+                    f"language {code!r} is not installed.\n"
+                    "Run --list to see what you have, or install more with:\n"
+                    "  brew install tesseract-lang"
+                )
 
     image = Image.open(args.image)
     config = f"--psm {args.psm}"

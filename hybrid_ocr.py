@@ -71,7 +71,15 @@ def prompt_for(label: str) -> str:
 
 
 # A number, allowing thousands separators, decimals, sign, percent and currency.
-NUMBER_RE = re.compile(r"[-+−]?[$€£¥]?\d[\d.,  ]*\d|\d")
+# Two alternatives, longest-first:
+#   1. space/apostrophe-grouped thousands ("2 019,75", "1'000'000") -- the
+#      grouping separator is only accepted when it really splits digits into
+#      threes, so "in 2024 3 people" reads as two numbers, not "20243".
+#   2. plain runs with dot and/or comma separators ("1,284.50", "42,3", "5548").
+NUMBER_RE = re.compile(
+    r"[-+\u2212]?[$\u20ac\u00a3\u00a5]?\d{1,3}(?:[\u00a0\u202f\u2007 '\u2019]\d{3})+(?:[.,]\d+)?"
+    r"|[-+\u2212]?[$\u20ac\u00a3\u00a5]?\d+(?:[.,]\d+)*"
+)
 
 _timeline: list[tuple[str, str, float, float]] = []
 _timeline_lock = threading.Lock()
@@ -86,23 +94,40 @@ def record(lane: str, what: str, t0: float, t1: float) -> None:
 # numeric helpers
 # --------------------------------------------------------------------------- #
 def normalise_number(raw: str) -> str | None:
-    """Canonical form so '1,284.50', '1 284.50' and '1284.5' compare equal.
+    """Canonical form so the same value written differently compares equal.
 
-    Returns None when the token isn't really a number, so junk never reaches
-    the vote.
+    Handles both conventions, which matters as soon as the document is European:
+    '1,284.50', '1.284,50' and '1 284,50' are all 1284.5.
+
+    Which separator is the decimal point is decided from evidence rather than an
+    assumed locale:
+      * both '.' and ',' present -> whichever comes last is the decimal point
+      * only one present         -> it groups thousands if it splits the digits
+                                    into exact threes, otherwise it is decimal
+
+    '1,284' is genuinely ambiguous (1284 or 1.284); the three-digit-group rule
+    resolves it as thousands, which is the commoner intent in tabular data.
+    Returns None for anything that isn't really a number, so junk never votes.
     """
     s = unicodedata.normalize("NFKC", raw).strip()
-    s = s.replace("−", "-").replace(" ", "")
-    s = re.sub(r"[$€£¥\s]", "", s)
+    s = s.replace("\u2212", "-")
+    # Space-ish and apostrophe separators carry no other meaning inside a number.
+    for ch in ("\u00a0", "\u202f", "\u2007", " ", "'", "\u2019"):
+        s = s.replace(ch, "")
+    s = re.sub(r"[$\u20ac\u00a3\u00a5]", "", s)
     sign = "-" if s.startswith("-") else ""
     s = s.lstrip("+-")
-    # Thousands separators: strip separators that split digits into 3s.
-    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
-        s = s.replace(",", "")
-    elif re.fullmatch(r"\d{1,3}(\.\d{3})+(,\d+)?", s):  # European style
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", "")
+
+    has_dot, has_comma = "." in s, "," in s
+    if has_dot and has_comma:
+        dec = "." if s.rfind(".") > s.rfind(",") else ","
+        thousands = "," if dec == "." else "."
+        s = s.replace(thousands, "").replace(dec, ".")
+    elif has_comma:
+        s = s.replace(",", "") if re.fullmatch(r"\d{1,3}(,\d{3})+", s) else s.replace(",", ".")
+    elif has_dot and re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
+        s = s.replace(".", "")
+
     if not re.fullmatch(r"\d+(\.\d+)?", s):
         return None
     if "." in s:
@@ -132,6 +157,21 @@ def dedupe_boxes(boxes, iou_thresh: float = 0.5):
         if not dup:
             kept.append(box)
     return kept
+
+
+# A digit run separated from the next by only a space, where the following run
+# is not a 3-digit group, is very likely a decimal separator the OCR lost:
+# "18,7%" misread as "18 7%". Every engine can drop the same faint comma, so the
+# vote sees unanimity and reports false confidence -- this is the one failure
+# mode agreement cannot catch, hence the explicit check.
+LOST_SEP_RE = re.compile(r"\d[\u00a0\u202f ]+(\d+)")
+
+
+def suspect_lost_separator(text: str) -> bool:
+    for m in LOST_SEP_RE.finditer(text or ""):
+        if len(m.group(1)) != 3:
+            return True
+    return False
 
 
 def numeric_tokens(text: str) -> list[str]:
@@ -409,6 +449,9 @@ def main():
     resolutions = []
     for nl in numeric_lines:
         v_text, v_conf, v_toks = nl["vl_future"].result(timeout=600)
+        nl["vl_text"] = v_text
+        suspect = any(suspect_lost_separator(t) for t in
+                      (v_text, nl["ppocr"]["text"], nl["tesseract"]["text"]))
         p_tok = numeric_tokens(nl["ppocr"]["text"])
         t_tok = numeric_tokens(nl["tesseract"]["text"])
         v_tok = numeric_tokens(v_text)
@@ -432,6 +475,12 @@ def main():
             if r is None:
                 continue
             r.update({
+                "suspect_lost_separator": suspect,
+                "raw_text": {
+                    "vl": v_text,
+                    "ppocr": nl["ppocr"]["text"],
+                    "tesseract": nl["tesseract"]["text"],
+                },
                 "index_in_line": k,
                 "block": nl["block"],
                 "block_label": nl["label"],
@@ -463,6 +512,7 @@ def main():
         "unanimous": sum(1 for r in resolutions if r["unanimous"]),
         "disputed": len(disputed),
         "token_count_mismatch_lines": sum(1 for r in resolutions if not r["token_counts_agree"]),
+        "suspect_lost_separator": sum(1 for r in resolutions if r.get("suspect_lost_separator")),
         "wall_seconds": round(time.time() - t_start, 2),
         "resolutions": resolutions,
     }
@@ -496,6 +546,18 @@ def main():
           f"{len(disputed)} disputed")
     print(f"wall {audit['wall_seconds']}s | CPU busy {cpu_busy:.1f}s | "
           f"GPU busy {gpu_busy:.1f}s | overlapped {overlap:.1f}s")
+    suspects = [r for r in resolutions if r.get("suspect_lost_separator")]
+    if suspects:
+        print(f"\n{len(suspects)} number(s) on lines where a decimal separator may have been "
+              f"lost -- unanimity here is NOT confirmation:")
+        seen = set()
+        for r in suspects:
+            key = r["raw_text"]["ppocr"]
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  [{r['block_label']}] ppocr read: {key!r}")
+
     if disputed:
         print("\ndisputed numbers (engine -> reading @ confidence):")
         for r in disputed[:15]:
