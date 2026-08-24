@@ -33,6 +33,41 @@ because no accuracy, cost or throughput work matters until they are fixed.
 
 ## 1. Stop-ship defects (all verified by execution)
 
+### 1.0 Every three-decimal number is multiplied by 1000 ✅ — worst defect in the repo
+
+`normalise_number`'s European-thousands rule (`hybrid_ocr.py:128-130`) matches
+`\d{1,3}[.,]\d{3}`, which is also the shape of an ordinary three-decimal-place value:
+
+```
+'0.125' -> '0125'      '0.500' -> '0500'      '2.750' -> '2750'
+'1.250' -> '1250'      '12.500' -> '12500'    '0,125' -> '0125'
+```
+
+`Digoxin 0.125 mg` — a narrow-therapeutic-index drug where three decimal places are the norm
+— is recorded in `numbers.json` as `0125`. Three decimal places are routine in clinical
+dosing, and this corrupts **all** of them.
+
+It is worse than an OCR error in two ways. Every engine reads the page **correctly**; the
+corruption happens in our own normaliser, downstream of the vote, so unanimity is preserved
+and nothing is flagged. And it is systematic rather than random, so no amount of
+cross-engine agreement can detect it — the exact shared-failure class the design cannot see.
+
+The provenance is worth stating: **I introduced this rule while fixing European decimal
+commas** for the Greek/Cyrillic work. `1.284,50` → `1284.5` required treating a dot before
+three digits as a thousands separator. That fix, applied to a locale where it does not hold,
+became a thousand-fold dose error.
+
+**Fix.** Gate the rule on the integer part having at least two digits and not starting with
+zero, so `1.284` is thousands but `0.125` and `2.750` are not. Better: decide the convention
+**per document** from the surrounding page rather than per token, and abstain when the page
+gives no evidence either way.
+
+**Drawbacks.** Per-document inference needs a document-level pass that does not exist yet,
+and a mixed-locale document (common in medical records — an imported foreign lab report)
+would need per-block handling. Gating on the integer part is the cheap fix and should land
+immediately; it still misreads a genuine European `0.125` meaning 125, which is rare in
+clinical text but not impossible.
+
 ### 1.1 One correlated variant can overrule eight agreeing readings, invent a value, and report unanimity ✅
 
 `reconcile()` at `hybrid_ocr.py:201-220` picks the reading with the **fewest tokens** among
@@ -200,6 +235,41 @@ structure.
 
 **Drawbacks.** Structural parsing is where most of the ambiguity lives; expect iteration.
 
+### 1.10b Ranges and dates fabricate negative numbers ✅
+
+`NUMBER_RE` opens both alternatives with an optional sign, so a hyphen between digits is
+read as a minus:
+
+```
+'120-80'      -> ['120', '-80']          blood pressure
+'2024-05-12'  -> ['2024', '-05', '-12']  an ISO date becomes three numbers, two negative
+'INR 2.5-3.5' -> ['2.5', '-3.5']         a negative INR is physically impossible
+```
+
+Reference ranges, dates and blood pressures all enter the vote as fabricated negatives.
+
+**Fix.** Require the sign to sit at a token boundary, and parse ranges, dates and BP
+structurally before tokenising.
+
+**Drawbacks.** Genuinely negative values written tight against a label (base excess,
+change-from-baseline) lose their sign, so the boundary rule needs care.
+
+### 1.10c The lost-separator heuristic fires on blood pressure ✅
+
+```
+suspect_lost_separator('BP 120 80')   -> True
+suspect_lost_separator('Dose 2 5 mg') -> True
+```
+
+The flag is also computed per **line** and stamped onto every number on it
+(`:665-666`, `:695`), so one suspicious pattern colours the whole row red.
+
+**Fix.** Return match spans and attach the flag only to the numbers actually involved.
+
+**Drawbacks.** Narrowing the pattern trades false positives for false negatives, and a false
+negative is a silently lost separator — the worse direction. `Dose 2 5 mg` is genuinely
+ambiguous and should stay flagged.
+
 ### 1.11 `separator_recovered` measures noise, and never reaches the reader ✅
 
 `hybrid_ocr.py:682` computes `recovered = n < max(len(...))` over **all** readings,
@@ -215,6 +285,21 @@ evidence was the token count dropping 18→17 with `42.3` appearing.
 **Fix.** Compute the flag only within the winning signature group, and render it.
 
 **Drawbacks.** None. It is a bug.
+
+### 1.11b 22% of VL calls are silently truncated ✅
+
+`vl_read` reads `usage`, `content` and `logprobs` (`:292-301`) but never inspects
+`choices[0].finish_reason`. Measured in the server log: **36 of 165 requests ended
+`finish_reason=length`** — nearly a quarter of all VL calls hit the token ceiling and the
+code cannot tell a truncated block from a complete one. In a medical table, truncation
+silently drops rows off the bottom.
+
+**Fix.** Check `finish_reason` and treat `length` as a failed block requiring a visible
+placeholder and a retry at a higher ceiling.
+
+**Drawbacks.** Note the direction: *lowering* `max_tokens` to save cost is the wrong
+response and would increase truncation. This is a correctness fix that costs tokens, not
+saves them.
 
 ### 1.12 Failed and dropped regions vanish, so an incomplete page looks complete ✅
 
@@ -260,6 +345,26 @@ losing dev/prod parity on Macs. Running the same quantisation in both environmen
 more than squeezing prod — a different quantisation is a different model and needs its own
 evaluation.
 
+### Two further blockers found on audit ✅
+
+**MLX-format weights are unusable by any portable backend.** `mlx-community/PaddleOCR-VL-4bit`
+is hardcoded at `hybrid_ocr.py:56`, `start_server.sh:8`, `PPOCRVL_mlx.py:25` and
+`PPOCRVL_1.py:25`. Those are mlx-quantised tensors; llama.cpp, vLLM and sglang cannot load
+them. Changing only the server URL leaves an invalid model name on the wire. The swap needs
+GGUF weights (llama.cpp) or the original safetensors (vLLM), which is a different artefact
+to fetch, pin and vendor — not a config change.
+
+**A missing logprobs array silently drops the VL model from the vote entirely.** This is the
+mirror image of defect 1.2 and equally silent. If a backend returns no `logprobs.content`
+(`hybrid_ocr.py:300-302`), `toks` is empty, `conf` becomes `0.0`,
+`vl_token_confidences` returns `{}` (`:327-329`), and the fallback at `:689` gives the VL
+engine confidence `0.0` for every number. Its vote weight at `:395` is then zero. **The
+three-engine vote degrades to two engines with no error, no log line, and no field in
+`numbers.json` recording that it happened.**
+
+So both failure directions are silent: a missing *per-token* logprob yields confidence 1.00,
+and a missing *logprobs array* yields 0.00. Neither is detectable from the output.
+
 ### Platform audit ✅
 
 - `safe_run.sh` uses `sysctl vm.swapusage`, `memory_pressure` and BSD `ps` — all macOS-only.
@@ -269,7 +374,41 @@ evaluation.
 - `make_fixture.py:12` hardcodes `/System/Library/Fonts/…`.
 - `_compat.py` is a Python 3.9 workaround; a 3.11+ floor deletes it.
 - `requirements.txt` and `requirements-mlx.txt` exist and are pinned at the top level, but
-  there is no transitive lockfile, and no CPU/CUDA split.
+  there is no transitive lockfile, and no CPU/CUDA split. `requirements.txt` pins 5 packages
+  while the venv holds 105.
+- **`paddlex` is imported directly at `hybrid_ocr.py:430` and is not declared in
+  `requirements.txt` at all.** It is present only as a transitive dependency of `paddleocr`.
+- **`safe_run.sh` does not fail on Linux — it lies.** With `vm.swapusage` and
+  `memory_pressure` absent, `swap_used_mb` and `free_pct` return empty strings, so `SW_DELTA`
+  is permanently 0 and `FP` defaults to 100. Both the swap guard and the free-memory guard
+  become permanent no-ops **while still printing `swap+0MB free=100%`**. In a container,
+  cgroup limits should replace it entirely.
+- **`pgrep -P "$CHILD"` enumerates only direct children**, despite the comment on the line
+  above claiming "every descendant". Grandchildren — notably the `tesseract` binary spawned
+  by a worker — are neither measured nor killed. That is true on macOS too, so the memory
+  ceiling has always been less tight than advertised.
+- `open(path, "w")` at `:720`, `:726` and `:751` has no `encoding=`, while `json.dump` uses
+  `ensure_ascii=False`. On Linux under `LC_ALL=C` the default is ASCII, so writing Greek,
+  Cyrillic or Chinese raises `UnicodeEncodeError`. *Estimated, not verified:* macOS forces
+  UTF-8 even under `LC_ALL=C`, so this could not be reproduced here.
+- **`safe_run.sh:19` defaults the log to `/tmp/safe_run_$$.log`** and redirects the child's
+  entire stdout there — which for medical scans contains recognised text. `hybrid_ocr.py:797`
+  prints a PP-OCR reading verbatim and `:806-809` prints disputed values. A predictable,
+  world-readable path in a shared container `/tmp`.
+
+### A silent-failure landmine worth its own note ✅
+
+`hybrid_ocr.py:430` imports a **private paddlex internal that carries an upstream typo**:
+
+```python
+from paddlex.inference.pipelines.paddleocr_vl.uilts import convert_otsl_to_html
+```
+
+Note `uilts`, not `utils`. It is wrapped in a bare `except Exception` that sets
+`convert_otsl_to_html = None`. If a paddlex upgrade fixes that typo or moves the module,
+**every table silently falls through to raw OTSL inside a `<pre>` block** (`:474`) — no
+warning, no failure, and all number provenance in tables is lost. Pin paddlex explicitly and
+make the import failure loud.
 
 ---
 
@@ -308,6 +447,32 @@ Measured: CPU busy 42.7s vs GPU busy 44.2s on a dense page — the lanes are **b
 one-sided speedups are Amdahl-capped at about 1.25×. And `OMP_NUM_THREADS` 2→6 gave **no
 gain** (31.8s → 33.6s): the CPU lane is a sequential loop of small OCR calls, so it needs
 task parallelism, not more threads.
+
+### Measured instrumentation of the two lanes ✅
+
+An instrumented run on `table_sample.png` (32 detected lines) gives the real cost structure:
+
+| Component | Cost | Share |
+|---|---|---|
+| CPU lane total | 24.96s (780 ms/line) | — |
+| ↳ **Tesseract** (4 calls/line) | 17.66s | **71%** of the lane |
+| ↳ PP-OCRv6 rec | 7.29s | 29% |
+
+**GPU concurrency is a myth.** Eight identical crops against the live server: sequential
+7.69s; with 2/3/4/6 pool workers 7.59 / 7.54 / 7.55 / 7.40s — **1.01–1.04×**. Calls
+serialise on the device. `--gpu-workers 3` buys nothing, and the module docstring's
+parallelism claim overstates it. The pool is still worth keeping, because the *cross-lane*
+overlap is real (measured 38.6s of overlap on the dense page); it is the intra-lane
+concurrency that is illusory.
+
+**The per-request floor is flat in crop size.** 8×20 px costs 211 prompt tokens / 0.99s;
+200×900 px (180,000 px) costs 237 tokens / 1.24s. So many small VL calls are dominated by
+fixed overhead, which makes **coalescing adjacent same-label text blocks into one call** a
+genuine win — and it needs the layout `order` field that `:566-568` currently discards.
+
+**Warm-worker scaling** (measured across processes): PP-OCRv6 rec 58 / 32 / 24 ms per line
+at 1 / 2 / 4 workers; Tesseract 15 / 8 / 6 ms. One worker's warm predictor set is 811 MB and
+page peak is 1017 MB, so on 8 GB the pool size is **2**, bounded by memory rather than cores.
 
 **Recommendations.** Async job API (`202`-and-poll — never a synchronous 30–60s request);
 prefork pool of **warm** workers, one page at a time per process (Paddle predictors are not
@@ -455,16 +620,17 @@ document only raises the recovery rate. It appeared in none of the 170 proposals
 
 ## 11. Sequencing
 
-1. **Defects 1.1–1.5, 1.11, 1.12** — the ones that report false confidence. Nothing else
-   matters first.
-2. **Evaluation harness** (§9) — otherwise steps 3+ are unfalsifiable.
-3. **`process_page` refactor + PDF driver** (§3) — everything multi-page depends on it.
-4. **Backend swap with a conformance probe** (§2) — before it becomes urgent.
-5. **Defects 1.6–1.10** — the number-semantics work. 1.9 (units) is the largest and most
+1. **Defect 1.0 first, today** — every three-decimal dose is currently corrupted by 1000×,
+   silently and unanimously. It is a two-line gate.
+2. **Defects 1.1–1.5, 1.11, 1.11b, 1.12** — the rest of the false-confidence set.
+3. **Evaluation harness** (§9) — otherwise steps 3+ are unfalsifiable.
+4. **`process_page` refactor + PDF driver** (§3) — everything multi-page depends on it.
+5. **Backend swap with a conformance probe** (§2) — before it becomes urgent.
+6. **Defects 1.6–1.10c** — the number-semantics work. 1.9 (units) is the largest and most
    justified.
-6. **Web service + warm workers** (§4).
-7. **Review UI** (§7) — arguably the actual product.
-8. **Preprocessing and de-correlation** (§5).
+7. **Web service + warm workers** (§4).
+8. **Review UI** (§7) — arguably the actual product.
+9. **Preprocessing and de-correlation** (§5).
 
 Governance question that precedes all of it: if this output informs clinical decisions, in
 the UK/EU it is plausibly a regulated medical device. That determines which of these changes
