@@ -232,6 +232,28 @@ def numeric_tokens(text: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # GPU lane: VL model over HTTP
 # --------------------------------------------------------------------------- #
+VL_MAX_PIXELS = 1024 * 28 * 28   # overridden from --vl-max-pixels
+
+
+def downscale_for_vl(img):
+    """Cap the pixels sent to the VL model.
+
+    Measured: feeding a 3x-rendered page straight to the 4-bit model made it
+    degenerate -- it produced 10,582 characters of repeated junk in place of a
+    377-character table, while the OCR engines read the same page correctly. The
+    mlx-vlm-server backend ignores paddlex's max_pixels, so the cap has to be
+    applied here. High resolution helps the OCR engines and hurts the VL model,
+    so the two get different images from the same crop.
+    """
+    h, w = img.shape[:2]
+    n = h * w
+    if n <= VL_MAX_PIXELS or n == 0:
+        return img
+    scale = (VL_MAX_PIXELS / n) ** 0.5
+    return cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                      interpolation=cv2.INTER_AREA)
+
+
 def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096, timeout: int = 300):
     """Transcribe one crop with the VL model. Returns (text, mean_conf, tokens).
 
@@ -240,7 +262,7 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096, timeout: int
     """
     import urllib.request
 
-    ok, buf = cv2.imencode(".png", image_bgr)
+    ok, buf = cv2.imencode(".png", downscale_for_vl(image_bgr))
     if not ok:
         return "", 0.0, []
     b64 = base64.b64encode(buf.tobytes()).decode()
@@ -518,8 +540,13 @@ def main():
     ap.add_argument("--pad", type=int, default=6,
                     help="pixels of padding added before re-reading a numeric line")
     ap.add_argument("--no-html", action="store_true", help="skip the HTML render")
+    ap.add_argument("--vl-max-pixels", type=int, default=1024 * 28 * 28,
+                    help="cap on pixels sent to the VL model; OCR engines still "
+                         "see the full-resolution crop")
     args = ap.parse_args()
 
+    global VL_MAX_PIXELS
+    VL_MAX_PIXELS = args.vl_max_pixels
     weights = {"vl": args.w_vl, "ppocr": args.w_ppocr, "tesseract": args.w_tesseract}
     os.makedirs(args.outdir, exist_ok=True)
 
