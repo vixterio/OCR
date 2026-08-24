@@ -19,6 +19,18 @@ verification are what appear here.
 
 ---
 
+## Status
+
+The code-level defects in §1 are **fixed** as of this commit, and `test_numeric.py`
+(44 checks) is the regression harness for the numeric ones. Verified end-to-end on a
+two-page scanned PDF: 40 numbers, none missing, no HTML corruption, exit code
+reflecting coverage. See RUNNING.md.
+
+What is **not** done: units are captured and risky ones flagged, but there is no
+plausibility checking of value-against-unit (§1.9 is partly addressed); the review
+thresholds are uncalibrated because there is still no ground-truth set (§9); and the
+web-service, container and portability work in §2 and §4 is unstarted.
+
 ## 0. Headline
 
 **The numeric layer is not safe for clinical use as written.** The three-engine vote is a
