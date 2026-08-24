@@ -169,3 +169,33 @@ wall 41.8s | CPU busy 14.8s | GPU busy 25.7s | overlapped 5.7s
 
 Note the honest ceiling: the GPU is the bottleneck here (25.7s vs 14.8s), so
 perfect overlap would save the CPU's time, not halve the wall clock.
+
+### Measured behaviour
+
+**`table_sample.png`** (English table, Tesseract fully capable) — all 22 table
+values resolved correctly, no duplicates, no misses. One dispute, and it is the
+case the whole design exists for:
+
+```
+vl=5548@1.00, ppocr=5548.39@1.00, tesseract=5548.39@0.95  ->  5548.39
+```
+
+The VL model dropped the decimals *while reporting confidence 1.00*. Two
+engines outvoted it.
+
+**`demo.png`** (Chinese newspaper, no `chi_sim` installed) — 22 numbers, 13
+disputed. Every dispute is Tesseract reading Chinese as Latin and emitting
+garbage (`2024` -> `25`, `5000` -> `50002`). It loses every time, because its
+confidence lands at 0.03-0.38 while the other two agree at 1.00. A weak engine
+outside its competence does not need to be excluded by hand; low confidence
+demotes it automatically.
+
+```
+wall 50.5s | CPU busy 31.0s | GPU busy 41.8s | overlapped 26.9s
+```
+
+Overlap is much better on a real page (27s of 50s) than on the small table,
+since there is more CPU work to hide behind the GPU.
+
+If you routinely OCR CJK pages, either install `tesseract-lang` so its readings
+are meaningful, or drop `--w-tesseract` to 0 to skip the noise.
