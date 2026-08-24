@@ -286,20 +286,28 @@ evidence was the token count dropping 18→17 with `42.3` appearing.
 
 **Drawbacks.** None. It is a bug.
 
-### 1.11b 22% of VL calls are silently truncated ✅
+### 1.11b Truncated VL calls are undetectable — but the rate is low ✅
 
 `vl_read` reads `usage`, `content` and `logprobs` (`:292-301`) but never inspects
-`choices[0].finish_reason`. Measured in the server log: **36 of 165 requests ended
-`finish_reason=length`** — nearly a quarter of all VL calls hit the token ceiling and the
-code cannot tell a truncated block from a complete one. In a medical table, truncation
-silently drops rows off the bottom.
+`choices[0].finish_reason`, so a block truncated at `max_tokens` is indistinguishable from a
+complete one. In a medical table, truncation drops rows off the bottom silently.
 
-**Fix.** Check `finish_reason` and treat `length` as a failed block requiring a visible
+**On the rate — a correction to a figure I published.** An agent reported "36 of 165 calls
+ended `finish_reason=length`", i.e. 22%, and I repeated it. Checking the log myself: of 74
+such events, **64 had `generated_tokens=1`** and a further 8 had 4 or 64 — those are the
+agent's own probe calls with tiny ceilings. Only **2 had `generated_tokens=256`**, matching
+the pipeline's own line-crop limit. The real pipeline truncation rate is **2 of 239 requests
+(~0.8%)**, not 22%. I was wrong by a factor of about 27, because I published an agent's
+measurement without separating its experiments from the pipeline's own traffic.
+
+The defect stands — two real truncations did occur and neither was detectable — but it is a
+correctness gap, not a widespread one.
+
+**Fix.** Check `finish_reason`; treat `length` as a failed block needing a visible
 placeholder and a retry at a higher ceiling.
 
-**Drawbacks.** Note the direction: *lowering* `max_tokens` to save cost is the wrong
-response and would increase truncation. This is a correctness fix that costs tokens, not
-saves them.
+**Drawbacks.** *Lowering* `max_tokens` to save cost is the wrong response and would increase
+truncation. This is a correctness fix that costs tokens rather than saving them.
 
 ### 1.12 Failed and dropped regions vanish, so an incomplete page looks complete ✅
 
@@ -460,19 +468,40 @@ An instrumented run on `table_sample.png` (32 detected lines) gives the real cos
 
 **GPU concurrency is a myth.** Eight identical crops against the live server: sequential
 7.69s; with 2/3/4/6 pool workers 7.59 / 7.54 / 7.55 / 7.40s — **1.01–1.04×**. Calls
-serialise on the device. `--gpu-workers 3` buys nothing, and the module docstring's
-parallelism claim overstates it. The pool is still worth keeping, because the *cross-lane*
-overlap is real (measured 38.6s of overlap on the dense page); it is the intra-lane
-concurrency that is illusory.
+serialise on the device, so `--gpu-workers 3` buys nothing. The pool is still worth keeping
+because the *cross-lane* overlap is real; it is the intra-lane concurrency that is illusory.
+
+*Correction to my own earlier statement:* I said the module docstring overstates this. It
+does not — `hybrid_ocr.py:18-26` claims only that HTTP calls "overlap with CPU work rather
+than competing for the GIL", which is true and is the cross-lane effect. The misleading
+label is elsewhere: the docstring and the HTML legend (`:519`) call this a "three-engine
+vote" when the arithmetic sums up to nine correlated readings (see §5).
+
+**The overlap metric is not measuring what I claimed.** `record("CPU", "layout", …)` at
+`:564` counts the layout pass as CPU-lane busy time, but layout runs *before* either lane
+starts. Every "CPU busy / overlapped" figure I quoted this session therefore includes
+pre-lane serial work in the CPU total. The lanes-are-balanced conclusion survives (layout is
+a small fraction), but the overlap numbers are not a clean lane metric and should not be
+treated as a product KPI.
 
 **The per-request floor is flat in crop size.** 8×20 px costs 211 prompt tokens / 0.99s;
 200×900 px (180,000 px) costs 237 tokens / 1.24s. So many small VL calls are dominated by
 fixed overhead, which makes **coalescing adjacent same-label text blocks into one call** a
 genuine win — and it needs the layout `order` field that `:566-568` currently discards.
 
-**Warm-worker scaling** (measured across processes): PP-OCRv6 rec 58 / 32 / 24 ms per line
-at 1 / 2 / 4 workers; Tesseract 15 / 8 / 6 ms. One worker's warm predictor set is 811 MB and
-page peak is 1017 MB, so on 8 GB the pool size is **2**, bounded by memory rather than cores.
+**Warm-worker scaling — reported but not relied upon.** An agent measured PP-OCRv6 rec at
+58 / 32 / 24 ms per line and Tesseract at 15 / 8 / 6 ms across 1 / 2 / 4 processes, with a
+warm predictor set of 811 MB. Its own adversarial review asked for those figures to be
+reconciled or withdrawn, and I have not reproduced them, so treat them as indicative only.
+
+The page-level worker pool that motivated them was **rejected**: the GPU's serial floor
+(~44s/page measured) already exceeds the CPU lane, so CPU-side parallelism cannot move
+pages/hour. Throughput has to come from more VL capacity, not more OCR workers.
+
+**Tesseract batching** — one process per block instead of four calls per line — survived
+review at an estimated **2×–6.6×** on Tesseract's share, with an unexplained 70ms-vs-135ms
+per-call gap left as an open question. It also writes PHI line crops to disk in bulk, which
+is a real regression in degree over the current per-call temp files.
 
 **Recommendations.** Async job API (`202`-and-poll — never a synchronous 30–60s request);
 prefork pool of **warm** workers, one page at a time per process (Paddle predictors are not
