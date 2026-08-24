@@ -364,3 +364,120 @@ so sustained batches will thermally throttle below these figures. If you need
 more than a few thousand pages a day, the answer is a second machine or a
 discrete GPU, not a cheaper cost model. 8 GB of RAM is also what keeps the VL
 model at 4-bit; the accuracy ceiling is set by that, not by the price.
+
+## Rasterisation: what it is, and whether it pays
+
+A PDF normally stores text as vectors -- glyph outlines plus positions -- with no
+pixels at all. Rasterising renders it to a bitmap at a chosen DPI, and the DPI
+decides how many pixels each glyph gets. At 72 DPI a comma in 9pt text occupies
+about one pixel; at 300 DPI it occupies four or five. That is the whole story
+behind the lost decimal separators: **no amount of post-hoc upscaling recovers a
+mark that was never sampled**, which is why the 4x upscale experiment failed.
+
+Measured on the same page rendered at 1x, 2x and 3x (`make_fixture.py`), where
+1x is roughly 70 DPI equivalent:
+
+| Render | Prompt | Completion | Total | Wall | Numbers | VL prose | Commas recovered |
+|---|---|---|---|---|---|---|---|
+| 1x | 4,125 | 326 | 4,451 | 48.0s | 18 | clean, 377 ch | 0 of 2 |
+| 2x | 5,457 | 4,399 | 9,856 | 63.1s | 17 | **degenerate, 4,424 ch** | 1 of 2 |
+| 3x | 7,265 | 4,276 | 11,541 | 100.1s | 17 | **degenerate, 10,582 ch** | 1 of 2 |
+| **3x + VL cap** | 4,756 | **325** | **5,081** | **31.8s** | 17 | clean, 373 ch | 1 of 2 |
+
+Two findings, and the second is the one that matters.
+
+**Resolution helps the OCR engines.** One of the two lost commas came back, and
+the count of separators recovered by a pre-processing variant went from 0 to 5.
+
+**Resolution breaks the 4-bit VL model.** At 2x and 3x it degenerated into
+repeated junk -- 10,582 characters of `<fcel>Zakrach<fcel>1<fcel>1` where the
+real table was 377. Completion tokens went 326 -> 4,276. Notably the *numbers
+were still all correct*, because they come from the OCR engines through the vote,
+not from the VL model; the vote absorbed a total collapse of one of its voters.
+
+So the two consumers want opposite things, and `--vl-max-pixels` now gives them
+different images from the same crop. With the cap, 3x costs **14% more tokens
+than 1x** (4,451 -> 5,081) and runs no slower, while keeping the accuracy gain.
+Without the cap it is a trap: 2.6x the tokens, 2x the wall clock, and worse
+output.
+
+**Verdict: worth it, but only with the cap.** Render at 200-300 DPI, cap what
+reaches the VL model, and expect diminishing returns above ~300 DPI.
+
+## What a 64 GB host would and would not buy
+
+### Speed
+
+64 GB is capacity, not compute, and per-page latency here is not
+memory-constrained -- peak usage is under 1 GB. What sets latency is the GPU and
+the CPU lane, and they are nearly balanced:
+
+```
+3x capped:   wall 31.8s | CPU busy 25.2s | GPU busy 20.3s | overlapped 18.2s
+dense page:  wall 54.2s | CPU busy 42.7s | GPU busy 44.2s | overlapped 38.6s
+```
+
+Balanced lanes mean Amdahl bites hard. An infinitely fast GPU would leave the
+dense page at ~43s instead of 54s -- about 1.25x. **Latency gains require
+speeding up both lanes.**
+
+And the CPU lane will not speed up by throwing threads at it. Measured, same
+page, `OMP_NUM_THREADS` 2 vs 6:
+
+```
+2 threads: wall 31.8s | CPU busy 25.2s
+6 threads: wall 33.6s | CPU busy 27.1s
+```
+
+No gain. The lane is a sequential loop of small OCR calls on small crops; there
+is little per-op parallelism to exploit. Using more cores needs *task*
+parallelism -- sharding lines or pages across worker processes -- which is a code
+change, not a hardware upgrade. It is single-threaded today because Paddle
+predictors are not thread-safe.
+
+So, estimating:
+
+| | Now (8 GB, M2 Air) | 64 GB host, est. |
+|---|---|---|
+| Per-page latency | 32-54s | **8-15s** (needs a faster GPU *and* a sharded CPU lane) |
+| Throughput | 66-115 pages/hr | **1,500-3,000 pages/hr** (16-32 concurrent workers at ~1 GB each) |
+
+Throughput is where the memory actually pays, and it pays by a factor of
+10-30x. Latency improves perhaps 3-4x, and only with the restructuring above.
+
+### Accuracy
+
+Less than intuition suggests. The obvious use of spare memory is a
+less-quantised model, so that was measured directly -- same page, same cap,
+4-bit vs 8-bit:
+
+| | 4-bit | 8-bit |
+|---|---|---|
+| Total tokens | 5,081 | 5,092 |
+| Wall | 31.8s | 33.0s |
+| Numbers resolved / disputed | 17 / 0 | 17 / 0 |
+| Greek title (truth `Οικονομική έκθεση`) | `Oğarkówuć` | `Оіковомікні Ёкєєп` |
+
+**No measurable change.** Identical numbers, identical cost, and the Greek is
+still wrong -- differently wrong, not better. That points at the model rather
+than its precision: PaddleOCR-VL v1 0.9B is trained predominantly on Chinese and
+English, and more bits will not teach it Greek.
+
+Where the headroom actually is, roughly in order:
+
+1. **A newer model.** PaddleOCR-VL-1.6 is the current release and has far more
+   traction than v1 (778k downloads vs 8k for the GGUF builds). This is the most
+   likely real gain, and it does not need 64 GB.
+2. **A Greek/Cyrillic-capable engine in the vote.** Tesseract's `script/Greek`
+   read the Greek sample character-exact -- it is already installed, and it is
+   better at Greek than the VL model is.
+3. **More pre-processing variants.** Cheap, and measurably effective already.
+4. **Larger PP-OCR server models.** Modest, since PP-OCRv6 medium is already at
+   0.95-1.00 confidence on digits.
+
+On the number-reading task the vote is already at 100% on every fixture here, so
+there is no headroom left to buy. The remaining errors are in *prose*, and the
+honest position is that further accuracy work cannot be evaluated without a
+labelled ground-truth set. Building one -- say 50 representative pages with
+known text and known figures, scored on CER and per-number accuracy -- is the
+prerequisite for any further claim, including the estimates above.
