@@ -327,3 +327,40 @@ become `1284.5`, and `42,3` becomes `42.3`.
 `1,284` is genuinely ambiguous (1284 or 1.284). The three-digit-group rule
 resolves it as thousands, which is the commoner intent in tabular data — but it
 is a choice, not a deduction.
+
+## Cost and throughput (measured, this M2 MacBook Air)
+
+Measured directly from the server's `usage` field, not estimated:
+
+| Page | Blocks | VL calls | Prompt | Completion | Total tokens | Wall | Pages/hr |
+|---|---|---|---|---|---|---|---|
+| `euro_table_sample.png` | 3 | 18 | 4,125 | 327 | 4,452 | 31.2s | 115 |
+| `table_sample.png` | 3 | 27 | 6,221 | 443 | 6,664 | 39.4s | 91 |
+| `demo.png` (dense newspaper) | 31 | 46 | 10,540 | 1,846 | 12,386 | 54.2s | 66 |
+
+**Prompt tokens dominate ~6:1**, because every block sends an image crop and
+image tokens are prompt tokens. Cost scales with the *number of blocks*, not
+with how much text comes out — a dense page costs more than a wordy one.
+
+### Self-hosted cost
+
+The M2 Air is fanless with a 30W adapter; sustained mixed CPU+GPU load draws
+roughly 15-22W at the wall. At 18W:
+
+| | Dense page |
+|---|---|
+| Energy | 0.27 Wh/page → **0.27 kWh per 1,000 pages** |
+| Electricity | **£0.07 / €0.08 / $0.05 per 1,000 pages** |
+| Hardware amortised (£999 over 3 yr, 8h x 250 days) | **£0.0025/page** |
+
+So the marginal cost is a rounding error — well under a penny per page, with
+hardware amortisation about 30x larger than electricity. For comparison, a
+cloud VLM at ~12k tokens/page lands nearer $5 per 1,000 pages, and hosted OCR
+APIs $1-10.
+
+**The real constraint is throughput, not money.** 66-115 pages/hour means
+10,000 pages takes 4-6 days of continuous running, and this machine is fanless
+so sustained batches will thermally throttle below these figures. If you need
+more than a few thousand pages a day, the answer is a second machine or a
+discrete GPU, not a cheaper cost model. 8 GB of RAM is also what keeps the VL
+model at 4-bit; the accuracy ceiling is set by that, not by the price.
