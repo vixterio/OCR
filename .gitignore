@@ -2,3 +2,4 @@
 .venv-mlx/
 output/
 *.log
+*.pid
