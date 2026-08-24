@@ -1,0 +1,5 @@
+# Server env (.venv-mlx, Python 3.12+) — Apple Silicon only.
+#   /opt/anaconda3/bin/python3.12 -m venv .venv-mlx
+#   .venv-mlx/bin/pip install -r requirements-mlx.txt
+mlx-vlm==0.6.15
+jinja2==3.1.6

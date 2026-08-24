@@ -9,10 +9,16 @@
 | `PPOCRVL_native.py` | Runs the VL model in-process (`native` backend). **Does not fit in 8 GB** — kept for reference / a bigger machine. |
 | `PPOCRVLflash.py`, `PPOCRVLtrans.py` | Empty placeholders, committed with no content. |
 | `_compat.py` | Python 3.9 asyncio fix for paddlex (see below). |
+| `PPOCRdet.py` | Detection only (PP-OCRv6 medium). Finds *where* text is — polygons, no characters. |
+| `PPOCRrec.py` | Recognition only (PP-OCRv6 medium). Reads characters from an image already cropped to one text line. |
+| `tesseract_ocr.py` | Tesseract OCR via pytesseract. No model download, no server. |
 | `safe_run.sh` | Runs a script under a memory watchdog that kills it before macOS starts swap-thrashing. |
 | `start_server.sh` | Starts the MLX VLM server on port 8080. |
+| `requirements.txt` / `requirements-mlx.txt` | Pinned deps for the two environments. |
 
 ## Usage
+
+### PaddleOCR-VL (layout-aware, needs the MLX server)
 
 ```bash
 ./start_server.sh
@@ -20,6 +26,40 @@
 ```
 
 Stop the server with `kill $(cat mlx_server.pid)`.
+
+### PP-OCRv6 detection / recognition (no server)
+
+```bash
+./safe_run.sh PPOCRdet.py demo.png   # 144 boxes on the demo page
+./safe_run.sh PPOCRrec.py            # crops the first detected line, then reads it
+```
+
+Detection and recognition are two halves of one pipeline. `PPOCRdet.py` outputs
+polygons; `PPOCRrec.py` expects a single-line crop and outputs characters. Give a
+full page to the recogniser and you get one garbled string. To do both at once,
+use the `PaddleOCR` pipeline class rather than the `TextDetection` /
+`TextRecognition` model classes.
+
+### Tesseract
+
+```bash
+brew install tesseract          # binary, English only
+brew install tesseract-lang     # extra languages (chi_sim, etc.)
+
+.venv/bin/python tesseract_ocr.py --list
+.venv/bin/python tesseract_ocr.py image.png -l eng
+```
+
+Writes plain text plus a TSV of per-word boxes and confidences to
+`output/tesseract/`. Tesseract needs no watchdog — it is a native binary using
+tens of MB.
+
+#### Tesseract vs PaddleOCR
+
+Tesseract is much lighter and needs no model download, but it is weaker on dense
+or non-Latin pages. On a clean English sample it scored 96.3% mean confidence
+with exact text. It cannot read `demo.png` at all without `chi_sim` installed,
+whereas PP-OCRv6 recognition returned a Chinese line at 0.9998 confidence.
 
 ## What was broken
 
