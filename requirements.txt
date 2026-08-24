@@ -1,0 +1,13 @@
+# Main env (.venv, Python 3.9) — PaddleOCR client + Tesseract
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+pytesseract==0.3.13
+pillow==11.3.0
+opencv-contrib-python==4.10.0.84
+
+# Non-pip prerequisite for tesseract_ocr.py:
+#   brew install tesseract        # binary (English only)
+#   brew install tesseract-lang   # extra language packs, needed for chi_sim etc.
+
+# The MLX server lives in a separate env (.venv-mlx, Python 3.12) because mlx
+# needs 3.10+; see requirements-mlx.txt.
