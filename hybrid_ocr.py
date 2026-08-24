@@ -81,6 +81,7 @@ NUMBER_RE = re.compile(
     r"|[-+\u2212]?[$\u20ac\u00a3\u00a5]?\d+(?:[.,]\d+)*"
 )
 
+_usage = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
 _timeline: list[tuple[str, str, float, float]] = []
 _timeline_lock = threading.Lock()
 
@@ -174,6 +175,51 @@ def suspect_lost_separator(text: str) -> bool:
     return False
 
 
+def preprocess_variants(img):
+    """Yield (name, image) readings of the same crop.
+
+    Measured on a line where the decimal comma was lost: padding alone recovered
+    one comma, upscale+Otsu recovered a different one, and neither recovered
+    both. Since the variants fail independently, running several and letting them
+    vote recovers more than any single choice of pre-processing.
+    """
+    yield "raw", img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    up = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
+    yield "up3x", cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
+    # Otsu turns a faint sub-pixel comma into solid black, which is exactly the
+    # mark thin-glyph loss destroys.
+    _, otsu = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield "otsu3x", cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+
+
+def digit_signature(tokens) -> str:
+    """The digits alone, ignoring where separators fell."""
+    return "".join(re.sub(r"\D", "", t) for t in tokens)
+
+
+def reconcile(readings):
+    """Agree on how many numbers a line holds before voting on their values.
+
+    readings: [(source, tokens, conf)].
+
+    Groups readings by digit signature and keeps the heaviest group, then -- and
+    this is the point -- within that group prefers the reading with the *fewest*
+    tokens. Same digits in fewer tokens means more separators were recovered,
+    and OCR loses faint separators far more often than it invents them. That
+    asymmetry is what turns ['18', '7'] back into ['18.7'].
+    """
+    if not readings:
+        return 0, []
+    weight_by_sig = defaultdict(float)
+    for _, toks, conf in readings:
+        weight_by_sig[digit_signature(toks)] += conf
+    best_sig = max(weight_by_sig.items(), key=lambda kv: kv[1])[0]
+    same = [r for r in readings if digit_signature(r[1]) == best_sig]
+    n = min(len(r[1]) for r in same)
+    return n, [r for r in same if len(r[1]) == n]
+
+
 def numeric_tokens(text: str) -> list[str]:
     out = []
     for m in NUMBER_RE.finditer(text or ""):
@@ -221,6 +267,11 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096, timeout: int
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.load(resp)
+    usage = data.get("usage") or {}
+    with _timeline_lock:
+        _usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        _usage["completion_tokens"] += usage.get("completion_tokens", 0)
+        _usage["calls"] += 1
     choice = data["choices"][0]
     text = choice["message"]["content"] or ""
     toks = []
@@ -318,7 +369,8 @@ def vote(readings: dict[str, tuple[str, float]], weights: dict[str, float]):
     for engine, (value, conf) in readings.items():
         if value is None:
             continue
-        score[value] += weights.get(engine, 1.0) * conf
+        base = engine.split(":")[0]
+        score[value] += weights.get(base, 1.0) * conf
     if not score:
         return None
     ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
@@ -336,6 +388,122 @@ def vote(readings: dict[str, tuple[str, float]], weights: dict[str, float]):
 
 
 # --------------------------------------------------------------------------- #
+# HTML rendering
+# --------------------------------------------------------------------------- #
+def md_to_html(blocks_md, resolutions, title):
+    """Render the page as standalone HTML.
+
+    The VL model already emits HTML tables for table blocks, so those are passed
+    through; the rest is converted with a small block-level markdown pass. Every
+    number the vote touched is wrapped in a <span> carrying its readings, so a
+    reviewer can hover a figure and see where it came from -- the audit trail the
+    markdown output could only put in a separate file.
+    """
+    from html import escape
+
+    # The VL model emits table blocks as OTSL (<fcel>/<nl>), not HTML. paddlex
+    # ships the converter and it handles row/column spans, so reuse it rather
+    # than re-deriving the grid here.
+    try:
+        from paddlex.inference.pipelines.paddleocr_vl.uilts import convert_otsl_to_html
+    except Exception:
+        convert_otsl_to_html = None
+
+    by_value = defaultdict(list)
+    for r in resolutions:
+        by_value[r["value"]].append(r)
+
+    def annotate(text):
+        """Wrap resolved numbers so their provenance survives into the page."""
+        def repl(m):
+            val = normalise_number(m.group())
+            hits = by_value.get(val)
+            if not hits:
+                return escape(m.group())
+            r = hits[0]
+            reads = "; ".join(f"{e}={v['value']}@{v['confidence']:.2f}"
+                              for e, v in r["readings"].items())
+            cls = "num"
+            if r.get("suspect_lost_separator"):
+                cls += " suspect"
+            elif not r["unanimous"]:
+                cls += " disputed"
+            return (f'<span class="{cls}" title="{escape(reads)}">'
+                    f'{escape(m.group())}</span>')
+        return NUMBER_RE.sub(repl, text)
+
+    parts = []
+    for md in blocks_md:
+        md = md.strip()
+        if not md:
+            continue
+        if "<fcel>" in md or "<ecel>" in md:
+            table = convert_otsl_to_html(md) if convert_otsl_to_html else None
+            if table:
+                # First row is the header in every table these documents produce.
+                table = re.sub(r"<tr>(.*?)</tr>",
+                               lambda m: "<thead><tr>"
+                                         + m.group(1).replace("<td>", "<th>").replace("</td>", "</th>")
+                                         + "</tr></thead><tbody>",
+                               table, count=1)
+                table = table.replace("</table>", "</tbody></table>")
+                parts.append(annotate(table))
+            else:
+                parts.append(f"<pre>{escape(md)}</pre>")
+            continue
+        if md.lstrip().startswith("<"):     # already HTML
+            parts.append(annotate(md))
+            continue
+        for para in md.split("\n\n"):
+            para = para.strip()
+            if not para:
+                continue
+            heading = re.match(r"^(#{1,6})\s+(.*)$", para)
+            if heading:
+                lvl = len(heading.group(1))
+                parts.append(f"<h{lvl}>{annotate(escape(heading.group(2)))}</h{lvl}>")
+            elif all(l.lstrip().startswith(("- ", "* ")) for l in para.splitlines()):
+                items = "".join(f"<li>{annotate(escape(l.lstrip()[2:]))}</li>"
+                                for l in para.splitlines())
+                parts.append(f"<ul>{items}</ul>")
+            else:
+                body = "<br>".join(annotate(escape(l)) for l in para.splitlines())
+                parts.append(f"<p>{body}</p>")
+
+    counts = {
+        "total": len(resolutions),
+        "disputed": sum(1 for r in resolutions if not r["unanimous"]),
+        "suspect": sum(1 for r in resolutions if r.get("suspect_lost_separator")),
+    }
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{escape(title)}</title>
+<style>
+  body {{ font: 16px/1.6 -apple-system, system-ui, sans-serif; max-width: 60rem;
+         margin: 2rem auto; padding: 0 1rem; color: #111; }}
+  table {{ border-collapse: collapse; margin: 1rem 0; }}
+  th, td {{ border: 1px solid #bbb; padding: .35rem .6rem; text-align: right; }}
+  th {{ background: #f2f2f2; }}
+  td:first-child, th:first-child {{ text-align: left; }}
+  .num {{ border-bottom: 1px dotted #999; cursor: help; }}
+  .num.disputed {{ background: #fff3cd; border-bottom-color: #b8860b; }}
+  .num.suspect {{ background: #f8d7da; border-bottom-color: #c00; }}
+  .legend {{ font-size: .85rem; color: #555; border-top: 1px solid #ddd;
+             margin-top: 2rem; padding-top: .75rem; }}
+  .legend span {{ padding: 0 .2rem; }}
+</style></head><body>
+{chr(10).join(parts)}
+<div class="legend">
+  {counts['total']} numbers resolved by three-engine vote &middot;
+  <span class="num disputed">{counts['disputed']} disputed</span> &middot;
+  <span class="num suspect">{counts['suspect']} possible lost separator</span>.
+  Hover any underlined number for the individual engine readings.
+</div>
+</body></html>
+"""
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def main():
@@ -347,6 +515,9 @@ def main():
     ap.add_argument("--w-ppocr", type=float, default=1.0, help="engine prior: PP-OCRv6")
     ap.add_argument("--w-tesseract", type=float, default=1.0, help="engine prior: Tesseract")
     ap.add_argument("--gpu-workers", type=int, default=3)
+    ap.add_argument("--pad", type=int, default=6,
+                    help="pixels of padding added before re-reading a numeric line")
+    ap.add_argument("--no-html", action="store_true", help="skip the HTML render")
     args = ap.parse_args()
 
     weights = {"vl": args.w_vl, "ppocr": args.w_ppocr, "tesseract": args.w_tesseract}
@@ -415,12 +586,26 @@ def main():
                 p_text, p_score = eng.rec_line(line_img)
                 if not numeric_tokens(p_text):
                     continue  # prose: the VL model handles it, no vote needed
+                # Pad before re-reading: detection boxes clip descenders, and a
+                # comma hangs below the baseline.
+                pad = args.pad
+                py1, py2 = max(0, ly1 - pad), min(block_img.shape[0], ly2 + pad)
+                px1, px2 = max(0, lx1 - pad), min(block_img.shape[1], lx2 + pad)
+                padded = block_img[py1:py2, px1:px2]
+                variant_reads = []
+                for vname, vimg in preprocess_variants(padded):
+                    vp_text, vp_score = eng.rec_line(vimg)
+                    variant_reads.append((f"ppocr:{vname}", vp_text, vp_score))
+                    vt_text, vt_confs = eng.tess_line(vimg, args.lang)
+                    vt_conf = (sum(vt_confs) / len(vt_confs)) if vt_confs else 0.0
+                    variant_reads.append((f"tesseract:{vname}", vt_text, vt_conf))
                 t_text, t_confs = eng.tess_line(line_img, args.lang)
                 # Hand the crop to the GPU immediately: the VL re-read then runs
                 # while this thread is still cropping and reading later lines,
                 # instead of waiting for the whole CPU lane to finish.
                 fut = gpu_pool.submit(vl_read, line_img, "text", 256)
                 numeric_lines.append({
+                    "variants": variant_reads,
                     "vl_future": fut,
                     "block": i,
                     "label": b["label"],
@@ -452,30 +637,36 @@ def main():
         nl["vl_text"] = v_text
         suspect = any(suspect_lost_separator(t) for t in
                       (v_text, nl["ppocr"]["text"], nl["tesseract"]["text"]))
-        p_tok = numeric_tokens(nl["ppocr"]["text"])
-        t_tok = numeric_tokens(nl["tesseract"]["text"])
-        v_tok = numeric_tokens(v_text)
-        vl_conf_by_value = vl_token_confidences(v_toks, v_tok)
         t_mean = (sum(nl["tesseract"]["confs"]) / len(nl["tesseract"]["confs"])
                   if nl["tesseract"]["confs"] else 0.0)
+        vl_conf_by_value = vl_token_confidences(v_toks, numeric_tokens(v_text))
 
-        # Vote position by position. Engines that disagree on how many numbers
-        # the line holds are recorded as such rather than force-aligned.
-        n = max(len(p_tok), len(t_tok), len(v_tok))
-        aligned = len({len(p_tok), len(t_tok), len(v_tok)}) == 1
+        # Every independent look at this line becomes a voter: the two base
+        # engines, the VL model, and each pre-processing variant.
+        sources = [("vl", v_text, v_conf),
+                   ("ppocr", nl["ppocr"]["text"], nl["ppocr"]["score"]),
+                   ("tesseract", nl["tesseract"]["text"], t_mean)]
+        sources += list(nl.get("variants", []))
+        readings = [(name, numeric_tokens(txt), conf)
+                    for name, txt, conf in sources if numeric_tokens(txt)]
+
+        n, kept = reconcile(readings)
+        aligned = len({len(r[1]) for r in readings}) == 1
+        recovered = n < max((len(r[1]) for r in readings), default=0)
+
         for k in range(n):
-            readings = {}
-            if k < len(v_tok):
-                readings["vl"] = (v_tok[k], vl_conf_by_value.get(v_tok[k], v_conf))
-            if k < len(p_tok):
-                readings["ppocr"] = (p_tok[k], nl["ppocr"]["score"])
-            if k < len(t_tok):
-                readings["tesseract"] = (t_tok[k], t_mean)
-            r = vote(readings, weights)
+            per_engine = {}
+            for name, toks, conf in kept:
+                if k >= len(toks):
+                    continue
+                c = vl_conf_by_value.get(toks[k], conf) if name == "vl" else conf
+                per_engine[name] = (toks[k], c)
+            r = vote(per_engine, weights)
             if r is None:
                 continue
             r.update({
                 "suspect_lost_separator": suspect,
+                "separator_recovered": recovered,
                 "raw_text": {
                     "vl": v_text,
                     "ppocr": nl["ppocr"]["text"],
@@ -502,6 +693,12 @@ def main():
     with open(md_path, "w") as fh:
         fh.write("\n\n".join(page_md) + "\n")
 
+    html_path = None
+    if not args.no_html:
+        html_path = os.path.join(args.outdir, "page.html")
+        with open(html_path, "w") as fh:
+            fh.write(md_to_html(page_md, resolutions, os.path.basename(args.image)))
+
     disputed = [r for r in resolutions if not r["unanimous"]]
     audit = {
         "image": args.image,
@@ -514,6 +711,13 @@ def main():
         "token_count_mismatch_lines": sum(1 for r in resolutions if not r["token_counts_agree"]),
         "suspect_lost_separator": sum(1 for r in resolutions if r.get("suspect_lost_separator")),
         "wall_seconds": round(time.time() - t_start, 2),
+        "separator_recovered": sum(1 for r in resolutions if r.get("separator_recovered")),
+        "vl_usage": {
+            "calls": _usage["calls"],
+            "prompt_tokens": _usage["prompt_tokens"],
+            "completion_tokens": _usage["completion_tokens"],
+            "total_tokens": _usage["prompt_tokens"] + _usage["completion_tokens"],
+        },
         "resolutions": resolutions,
     }
     audit_path = os.path.join(args.outdir, "numbers.json")
@@ -540,7 +744,14 @@ def main():
         for c, d in gpu_m:
             overlap += max(0.0, min(b, d) - max(a, c))
 
+    u = audit["vl_usage"]
+    wall = audit["wall_seconds"]
+    print(f"\nVL usage: {u['calls']} calls, {u['prompt_tokens']} prompt + "
+          f"{u['completion_tokens']} completion = {u['total_tokens']} tokens "
+          f"({u['total_tokens'] / wall:.0f} tok/s over the page)")
     print(f"\nwrote {md_path}")
+    if html_path:
+        print(f"wrote {html_path}")
     print(f"wrote {audit_path}")
     print(f"\nnumbers: {len(resolutions)} resolved, {audit['unanimous']} unanimous, "
           f"{len(disputed)} disputed")
@@ -557,6 +768,10 @@ def main():
                 continue
             seen.add(key)
             print(f"  [{r['block_label']}] ppocr read: {key!r}")
+
+    rec_n = audit["separator_recovered"]
+    if rec_n:
+        print(f"{rec_n} number(s) had a separator recovered by a pre-processing variant")
 
     if disputed:
         print("\ndisputed numbers (engine -> reading @ confidence):")
