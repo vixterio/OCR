@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 *.wd
 *.watchdog
+vl_worker.err

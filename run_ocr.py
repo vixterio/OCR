@@ -90,6 +90,14 @@ def main():
                          "dominated the run")
     ap.add_argument("--no-vl-line-reads", dest="vl_line_reads",
                     action="store_false")
+    ap.add_argument("--sequential-lanes", dest="sequential_lanes",
+                    action="store_true", default=None,
+                    help="finish the VL page call and release the model before "
+                         "loading the OCR engines. Defaults ON for page-granularity "
+                         "models under 12 GB, where holding both at once exhausts "
+                         "memory and shows up as a Metal GPU timeout")
+    ap.add_argument("--concurrent-lanes", dest="sequential_lanes",
+                    action="store_false")
     ap.add_argument("--transport", choices=("auto", "http", "worker"), default="auto",
                     help="auto uses each family's required transport: http for "
                          "PaddleOCR-VL and Qwen (per-token logprobs available), "
@@ -121,6 +129,8 @@ def main():
     args.variants = prof.variants
     if args.vl_line_reads is None:
         args.vl_line_reads = (spec.granularity == "block")
+    if args.sequential_lanes is None:
+        args.sequential_lanes = (spec.granularity == "page" and prof.ram_gb < 12)
 
     print(f"mode {args.mode}  |  {spec.family}  |  {spec.granularity}-granularity"
           f"{'  |  numeric vote ON' if verify else '  |  no verification'}")
@@ -129,6 +139,12 @@ def main():
     if verify:
         print(f"per-line VL re-reads: {'on' if args.vl_line_reads else 'off'}"
               f"{'' if args.vl_line_reads else ' (page model already read the line)'}")
+        if not args.vl_line_reads:
+            print(f"  -> numbers are voted by PP-OCRv6 + Tesseract only; the VL model "
+                  f"contributes the prose, not the number vote. Pass --vl-line-reads "
+                  f"for a three-family vote (much slower on page models).")
+        print(f"lanes: {'sequential' if args.sequential_lanes else 'concurrent'}"
+              f"{' (VL model released before the OCR engines load)' if args.sequential_lanes else ''}")
     # The watchdog is a separate process, so hand it the ceiling this profile
     # chose instead of printing a number nothing enforces.
     os.environ.setdefault("RSS_LIMIT_MB", str(prof.rss_limit_mb))
@@ -201,13 +217,24 @@ def main():
 
     from paddleocr import LayoutDetection
     layout = LayoutDetection(model_name=args.layout_model)
-    eng = ocr_core.CpuEngines() if verify else None
+
+    def eng_factory():
+        return ocr_core.CpuEngines()
+
+    # In sequential mode the OCR engines are built after the VL model has been
+    # released, so they are never both resident.
+    eng = None if (args.sequential_lanes or not verify) else eng_factory()
     pool = ThreadPoolExecutor(max_workers=max(1, gpu_workers), thread_name_prefix="gpu")
     pages = []
     try:
         for idx, img, dpi, source, chars in hybrid_ocr.iter_input_pages(args.input, args):
             pg = ocr_core.process_page(img, idx, eng, pool, spec, model, verify,
-                                       args, priors, vl_fn=vl_fn, layout=layout)
+                                       args, priors, vl_fn=vl_fn, layout=layout,
+                                       eng_factory=eng_factory if verify else None,
+                                       after_vl=(transport.close
+                                                 if (args.sequential_lanes and transport
+                                                     and not args.vl_line_reads)
+                                                 else None))
             pg.dpi, pg.source = dpi, source
             pages.append(pg)
             flagged = sum(1 for n in pg.numbers if n.get("needs_review"))

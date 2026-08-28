@@ -54,9 +54,14 @@ class WorkerTransport:
         cmd = [python_bin, script, "--model", model]
         if revision:
             cmd += ["--revision", revision]
+        self._err_path = os.environ.get("VL_WORKER_LOG", "vl_worker.err")
+        self._err_file = open(self._err_path, "w", buffering=1)
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            # Keep the worker's diagnostics. Discarding them meant a load
+            # failure or a Metal error surfaced only as "VL worker exited during
+            # startup", which cost hours of guessing.
+            stderr=self._err_file, text=True, bufsize=1)
         deadline = time.time() + startup_timeout
         while True:
             if self.proc.poll() is not None:

@@ -150,7 +150,7 @@ def fill_placeholders(markup: str, slots: list, annotate) -> str:
 
 
 def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args, priors,
-                 vl_fn=None, layout=None):
+                 vl_fn=None, layout=None, eng_factory=None, after_vl=None):
     """Layout, VL transcription, optional numeric verification, for one page.
 
     `vl_fn(image, prompt, max_tokens) -> VLReply` abstracts the transport, because
@@ -205,6 +205,33 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
             futures[b.index] = gpu_pool.submit(
                 vl_fn, crop(b.box), block_prompt(spec, b.label),
                 spec.max_tokens_page)
+
+    def account(reply):
+        page.vl_calls += 1
+        page.vl_prompt_tokens += reply.prompt_tokens
+        page.vl_completion_tokens += reply.completion_tokens
+
+    def collect_page_reply():
+        try:
+            reply = page_future.result(timeout=args.block_timeout)
+            account(reply)
+            page.page_markdown = reply.text
+            for b in blocks:
+                if b.status == "pending":
+                    b.status = "ok" if reply.text else "empty"
+                    b.note = "" if reply.text else "VL returned no text for the page"
+            if reply.truncated:
+                for b in blocks:
+                    if b.status == "ok":
+                        b.status, b.note = "truncated", "VL page reply hit max_tokens"
+        except VLError as exc:
+            for b in blocks:
+                if b.status == "pending":
+                    b.status, b.note = "failed", f"VL contract violation: {exc}"
+        except Exception as exc:
+            for b in blocks:
+                if b.status == "pending":
+                    b.status, b.note = "failed", f"VL page call failed: {exc}"
 
     # ---- CPU lane ----------------------------------------------------------
     numeric_lines: list[dict] = []
@@ -267,38 +294,33 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                                   if args.vl_line_reads else None),
                 })
 
+    # ---- sequential lanes on a memory-constrained machine -------------------
+    # The two-lane design assumes both models fit at once. On 8 GB with a
+    # page-granularity model that is false: Paddle holds ~1.1 GB while DeepSeek
+    # wants ~2.6 GB of Metal buffers, the machine swaps, and the Metal command
+    # buffer misses its execution deadline -- surfacing as a GPU timeout rather
+    # than an out-of-memory error. A page model makes ONE VL call, so the overlap
+    # was worth little anyway: finishing it and releasing the model before the OCR
+    # engines load costs a few seconds of wall clock and roughly halves peak
+    # memory.
+    sequential = bool(getattr(args, "sequential_lanes", False))
+
+    if sequential and page_future is not None:
+        collect_page_reply()
+        page_future = None
+        if after_vl is not None:
+            after_vl()          # releases the VL model before Paddle loads
+        if verify and eng is None and eng_factory is not None:
+            eng = eng_factory()
+
     if verify:
         t = threading.Thread(target=cpu_lane, name="cpu-lane")
         t.start()
         t.join()
 
     # ---- collect VL --------------------------------------------------------
-    def account(reply):
-        page.vl_calls += 1
-        page.vl_prompt_tokens += reply.prompt_tokens
-        page.vl_completion_tokens += reply.completion_tokens
-
     if page_future is not None:
-        try:
-            reply = page_future.result(timeout=args.block_timeout)
-            account(reply)
-            page.page_markdown = reply.text
-            for b in blocks:
-                if b.status == "pending":
-                    b.status = "ok" if reply.text else "empty"
-                    b.note = "" if reply.text else "VL returned no text for the page"
-            if reply.truncated:
-                for b in blocks:
-                    if b.status == "ok":
-                        b.status, b.note = "truncated", "VL page reply hit max_tokens"
-        except VLError as exc:
-            for b in blocks:
-                if b.status == "pending":
-                    b.status, b.note = "failed", f"VL contract violation: {exc}"
-        except Exception as exc:
-            for b in blocks:
-                if b.status == "pending":
-                    b.status, b.note = "failed", f"VL page call failed: {exc}"
+        collect_page_reply()
     else:
         for idx, fut in futures.items():
             b = blocks[idx]
@@ -343,6 +365,11 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
     for nl in numeric_lines:
         vl_conf, vl_text, vl_conf_available = {}, "", True
         try:
+            if nl["vl_future"] is None:
+                # Deliberately not requested (see --vl-line-reads), which is a
+                # different thing from a call that failed, and must not be
+                # recorded as an error or force review.
+                raise SkipVL()
             reply = nl["vl_future"].result(timeout=args.block_timeout)
             account(reply)
             vl_conf_available = reply.confidence_available
@@ -482,9 +509,18 @@ def render_document(pages, title: str, spec, model: str, verify: bool, mode: str
                       f"per-token confidence, so that reading voted with a "
                       f"declared prior rather than a measured one and does not "
                       f"count towards corroboration.")
-        verified = (f"<strong>{total}</strong> numbers were read by more than one "
-                    f"engine family and resolved by confidence-weighted vote; "
-                    f"<strong>{review}</strong> need human review.{caveat}")
+        skipped = sum(1 for p in pages for n in p.numbers
+                      if n.get("vl_line_read_skipped"))
+        who = ("PP-OCRv6 and Tesseract" if skipped == total and total
+               else "the VL model, PP-OCRv6 and Tesseract")
+        extra = ""
+        if skipped and skipped == total:
+            extra = (" The VL model contributed the prose on this page but did not "
+                     "take part in the number vote (per-line VL re-reads were off), "
+                     "so these are two-family decisions.")
+        verified = (f"<strong>{total}</strong> numbers were read by {who} and resolved "
+                    f"by confidence-weighted vote; <strong>{review}</strong> need "
+                    f"human review.{extra}{caveat}")
     else:
         verified = (f"<strong>No numeric verification was performed in this mode.</strong> "
                     f"All <strong>{total}</strong> numbers below are single readings "
