@@ -254,6 +254,11 @@ def main():
         "input": args.input, "mode": args.mode, "vl_model": model,
         "vl_family": spec.family, "granularity": spec.granularity,
         "verification": verify, "ram_gb": prof.ram_gb,
+        # Recorded so a scored run is unambiguous about which configuration
+        # produced it -- the whole point of the comparison.
+        "vl_line_reads": bool(args.vl_line_reads),
+        "sequential_lanes": bool(args.sequential_lanes),
+        "variants": list(args.variants),
         "transport": transport_kind,
         "engine_priors": priors if verify else None,
         "wall_seconds": round(time.time() - t0, 2),

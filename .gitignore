@@ -8,3 +8,4 @@ __pycache__/
 *.wd
 *.watchdog
 vl_worker.err
+matrix.out
