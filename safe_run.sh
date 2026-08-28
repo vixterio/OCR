@@ -19,6 +19,11 @@ THREADS=${THREADS:-2}
 # nice 10 and succeeded at normal priority on the same input. So GPU-bound work
 # runs at NICE=0 by default; raise it for CPU-only jobs if you want the machine
 # to stay responsive.
+#
+# Note the interaction with the power guards below: NICE=0 means the run takes
+# the machine's full attention, which on a fanless Air on battery is how it ends
+# up switching off. The two settings are a pair -- if you raise NICE to be kind
+# to the machine, the Metal deadline may bite; if you keep NICE=0, plug in.
 NICE=${NICE:-0}
 POLL=${POLL:-1}
 # Power guards. This is a fanless MacBook Air M2: sustained VL inference is the
