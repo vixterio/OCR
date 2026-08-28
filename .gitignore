@@ -5,3 +5,5 @@ output/
 *.pid
 __pycache__/
 *.pyc
+*.wd
+*.watchdog

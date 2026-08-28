@@ -141,10 +141,17 @@ class VLReply:
     truncated: bool
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # False when the backend cannot supply per-token logprobs at all. The vote
+    # must then treat the VL reading as evidence without a confidence, rather
+    # than silently assigning it one -- assigning one is how a missing signal
+    # became "confidence 1.00" in an earlier version of this code.
+    confidence_available: bool = True
 
 
 def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
-            timeout: int = 300, require_logprobs: bool = True) -> VLReply:
+            timeout: int = 300, require_logprobs: bool = True,
+            prompt: str | None = None, model: str | None = None,
+            strip_patterns: tuple = ()) -> VLReply:
     """Transcribe one crop. Raises VLError if the backend breaks the contract.
 
     Two silent failures are deliberately made loud here. A per-token entry with no
@@ -160,10 +167,10 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
         raise VLError("could not PNG-encode the crop")
     b64 = base64.b64encode(buf.tobytes()).decode()
     payload = {
-        "model": VL_MODEL,
+        "model": model or VL_MODEL,
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            {"type": "text", "text": prompt_for(label)},
+            {"type": "text", "text": prompt if prompt is not None else prompt_for(label)},
         ]}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -201,6 +208,9 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
                           "treat absent evidence as confidence 1.00")
         toks.append((e.get("token", ""), math.exp(e["logprob"])))
 
+    for pat in strip_patterns:
+        text = re.sub(pat, "", text, flags=re.MULTILINE | re.DOTALL)
+    text = text.strip()
     conf = sum(c for _, c in toks) / len(toks) if toks else 0.0
     usage = data.get("usage") or {}
     return VLReply(text, conf, toks, finish == "length",
@@ -249,6 +259,13 @@ def preprocess_variants(img):
     yield "up3x", cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
     _, otsu = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     yield "otsu3x", cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+    # Otsu picks one global threshold, which loses thin strokes where a scan's
+    # brightness drifts across the page -- common with photocopies and fax. An
+    # adaptive threshold decides locally, so it keeps a faint comma that a global
+    # cut would drop. Only enabled on machines with headroom for the extra reads.
+    adaptive = cv2.adaptiveThreshold(up, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 31, 10)
+    yield "adaptive3x", cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)
 
 
 def dedupe_boxes(boxes, iou_thresh: float = 0.5):
@@ -450,11 +467,14 @@ class PageResult:
     vl_prompt_tokens: int = 0
     vl_completion_tokens: int = 0
     vl_calls: int = 0
+    page_markdown: str = ""      # set by page-granularity VL models
 
     @property
     def incomplete(self) -> list[Block]:
+        # 'empty' belongs here: a VL reply with no text used to leave every block
+        # marked empty, render nothing, and report "0 regions not transcribed".
         return [b for b in self.blocks
-                if b.status in ("failed", "truncated", "quarantined")]
+                if b.status in ("failed", "truncated", "quarantined", "empty")]
 
 
 def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResult:
@@ -719,6 +739,8 @@ def make_annotator(numbers: list[dict]):
             else:
                 pos[0] += 1
                 cls = ["num"]
+                if rec.get("verified") is False:
+                    cls.append("unverified")
                 if rec.get("needs_review"):
                     cls.append("review")
                 if rec.get("suspect_lost_separator"):
@@ -733,11 +755,29 @@ def make_annotator(numbers: list[dict]):
                     extra += " | flags: " + ",".join(rec["numeric_flags"])
                 if rec.get("dissent"):
                     extra += f" | {len(rec['dissent'])} dissenting reading(s)"
-                title = f"voted {numeric.format_key(rec['value'])} | {reads}{extra}"
+                voted = numeric.format_key(rec["value"])
+                if rec.get("verified") is False:
+                    title = (f"{voted} — single VL reading, NOT verified by any "
+                             f"vote{extra}")
+                    shown = q.raw
+                else:
+                    title = f"voted {voted} | {reads}{extra}"
+                    # Display the value the vote chose, not the reading it
+                    # rejected. Previously the page showed the VL model's digits
+                    # while the tooltip held the decision, so a vote that
+                    # correctly resolved 12.5 mg still printed "125" on screen --
+                    # a ten-fold dose, visible to a clinician who never hovers.
+                    shown = voted
                 mark = " ⚑" if rec.get("needs_review") else ""
+                body = html.escape(shown)
+                if rec.get("verified") is not False and shown != q.raw:
+                    # Keep the rejected reading visible, struck through, so the
+                    # correction is auditable on the page itself.
+                    body = (f'{html.escape(shown)} '
+                            f'<s class="rejected">{html.escape(q.raw)}</s>')
                 out.append(f'<span class="{" ".join(cls)}" '
                            f'title="{html.escape(title, quote=True)}">'
-                           f'{html.escape(q.raw)}{mark}</span>')
+                           f'{body}{mark}</span>')
             last = q.span[1]
         out.append(html.escape(text[last:]))
         return "".join(out)
@@ -765,6 +805,7 @@ td:first-child, th:first-child { text-align:left; }
 .num.suspect, .num.disputed { background:var(--bad-bg); color:var(--bad);
               border-bottom:2px solid var(--bad); font-weight:600; }
 .num.unverified { border-bottom:1px dashed var(--note); }
+.rejected { opacity:.65; font-size:.9em; }
 .page { border-top:3px solid var(--line); margin-top:2.5rem; padding-top:.5rem; }
 .gap { background:var(--bad-bg); color:var(--bad); border:2px dashed var(--bad);
        padding:.6rem .8rem; margin:.8rem 0; font-weight:600; }

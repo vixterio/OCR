@@ -116,6 +116,26 @@ dose corruption, naked leading decimals, units, ranges, dates, fractions, and th
 English and European fixture values. Run it before and after any edit to
 `numeric.py`.
 
+## Power: plug in before running
+
+This is a **fanless MacBook Air M2**. Sustained VL inference is the heaviest load
+it ever sees, and running it on battery has shut the machine down mid-run. The
+watchdog now refuses to start on battery below 40%, stops the child below 15%,
+and aborts if the CPU speed limit indicates thermal throttling:
+
+```bash
+REQUIRE_AC=1 ./safe_run.sh run_ocr.py doc.pdf --mode qwen+ocr   # refuse unless plugged in
+MIN_BATTERY_PCT=60 ./safe_run.sh ...                            # stricter floor
+```
+
+`run_all_modes.sh` warns up front if you are on battery and inserts a 45s
+cool-down between modes (`COOLDOWN=0` to disable), because six sequential
+multi-gigabyte model loads is where the trouble happened.
+
+Do not use `caffeinate` to keep the machine awake during these runs. Preventing
+sleep while a fanless laptop is under sustained GPU load removes the last thing
+that would have saved it.
+
 ## Known limits
 
 - **Prose is not verified.** Only numbers go through the vote. Prose comes from

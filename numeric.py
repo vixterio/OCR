@@ -66,13 +66,24 @@ class Quantity:
         together, but `values` keeps the surface form so the precision difference
         is still visible in the audit.
         """
-        nums = []
-        for v in self.values:
-            try:
-                nums.append(str(Decimal(v).normalize()))
-            except InvalidOperation:
-                nums.append(v)
-        return f"{self.kind}:{'/'.join(nums)}:{self.unit or ''}"
+        return f"{self.kind}:{'/'.join(_canonical(v) for v in self.values)}:{self.unit or ''}"
+
+
+def _canonical(v: str) -> str:
+    """Canonical numeric form for comparison, without scientific notation.
+
+    `Decimal("140").normalize()` is `1.4E+2`, so a sodium of 140 was reaching the
+    audit and the clinician's tooltip as "1.4E+2". Integral values are re-quantised
+    to a plain integer; fractional values keep normalise's trailing-zero collapse
+    so that '5.0' and '5' still compare equal.
+    """
+    try:
+        d = Decimal(v)
+    except InvalidOperation:
+        return v
+    if d == d.to_integral_value():
+        return str(d.quantize(Decimal(1)))
+    return str(d.normalize())
 
 
 def _decimal_or_none(s: str):
@@ -119,8 +130,17 @@ def normalise(raw: str) -> tuple[str | None, list[str]]:
         s = s.replace("," if dec == "." else ".", "").replace(dec, ".")
     elif has_comma:
         parts = s.split(",")
-        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and parts[0]):
-            s = s.replace(",", "")            # grouping
+        if len(parts) > 2:
+            s = s.replace(",", "")            # 1,284,567 -- multiple groups
+        elif (len(parts) == 2 and len(parts[1]) == 3 and parts[0]
+              and parts[0][0] != "0"):
+            # Same guard as the dot branch below, and for the same reason: without
+            # the leading-zero test '0,125' became '0125', a thousand-fold dose
+            # error on a number written the European way. Three decimal places are
+            # routine in clinical dosing, and an integer part of '0' can never be
+            # a thousands group.
+            s = s.replace(",", "")
+            flags.append("ambiguous_thousands")
         else:
             s = s.replace(",", ".")           # decimal comma
     elif has_dot:

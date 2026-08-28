@@ -91,6 +91,28 @@ print("\n=== reading order is preserved ===")
 check("'in 2024 3 people'", vals("in 2024 3 people"), ["2024", "3"])
 check("'Wzrost 18,7% — 42,3%'", vals("Wzrost 18,7% — 42,3%"), ["18.7", "42.3"])
 
+print("\n=== defect: the comma branch must not inflate a dose 1000x either ===")
+# A '0' integer part can never be a thousands group, so these are unambiguous.
+for raw, want in [("0,125", "0.125"), ("0,500", "0.500"), ("0,05", "0.05")]:
+    check(f"normalise({raw!r})", normalise(raw)[0], want)
+check("'Digoxin 0,125 mg' values", vals("Digoxin 0,125 mg"), ["0.125"])
+# With a non-zero integer part it is genuinely ambiguous: '2,750' is 2750 in
+# English and 2.750 in German. There is no safe default -- guessing thousands
+# inflates a European dose 1000x, guessing decimal deflates an English one -- so
+# the locale-conventional reading is taken AND the value is flagged for review.
+check("'1,284' reads as thousands", normalise("1,284")[0], "1284")
+check("'2,750' reads as thousands", normalise("2,750")[0], "2750")
+check("'2,750' flagged ambiguous", "ambiguous_thousands" in normalise("2,750")[1], True)
+check("'1,125' flagged ambiguous", "ambiguous_thousands" in normalise("1,125")[1], True)
+check("dot form flagged too", "ambiguous_thousands" in normalise("1.125")[1], True)
+
+print("\n=== defect: integers must not render in scientific notation ===")
+from numeric import format_key
+for raw, want in [("140 mg", "140 mg"), ("1000 mg", "1000 mg"), ("100 %", "100%")]:
+    q = extract(raw)[0]
+    check(f"display({raw!r})", format_key(q.key), want)
+check("'5.0' and '5' still equal", extract("5.0")[0].key == extract("5")[0].key, True)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
