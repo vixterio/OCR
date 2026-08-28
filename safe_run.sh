@@ -10,6 +10,15 @@ set -uo pipefail
 RSS_LIMIT_MB=${RSS_LIMIT_MB:-4200}     # kill child above this resident size
 SWAP_GROWTH_MB=${SWAP_GROWTH_MB:-700}  # kill if swap grows this much over baseline
 SWAP_MIN_RSS_MB=${SWAP_MIN_RSS_MB:-1500} # ...but only once the child is itself this big
+# RSS IS BLIND TO MLX. A VL worker holding a 2.56 GB model reported 769 MB of
+# tree RSS while system free memory fell to 4% and swap grew 3.5 GB, because MLX
+# allocates through Metal and those buffers are not ordinary anonymous RSS. Every
+# RSS-gated guard is therefore useless for this workload, which is how a machine
+# shutdown happened with the watchdog running and reporting healthy numbers.
+# So: absolute free memory is NOT an attribution question. Below this floor the
+# machine is in danger whoever caused it, and our job is the one we control.
+FREE_PCT_HARD=${FREE_PCT_HARD:-12}       # stop here regardless of child RSS
+FREE_HARD_STRIKES=${FREE_HARD_STRIKES:-2}
 FREE_PCT_MIN=${FREE_PCT_MIN:-8}        # kill if system free memory drops below this %
 FREE_STRIKES=${FREE_STRIKES:-3}        # ...for this many consecutive samples
 THREADS=${THREADS:-2}
@@ -25,7 +34,9 @@ THREADS=${THREADS:-2}
 # up switching off. The two settings are a pair -- if you raise NICE to be kind
 # to the machine, the Metal deadline may bite; if you keep NICE=0, plug in.
 NICE=${NICE:-0}
-POLL=${POLL:-1}
+# Memory went 14% -> 5% -> 4% free within a few samples during the crash. Polling
+# every 15s, as the comparison matrix did, cannot catch that. Keep it tight.
+POLL=${POLL:-2}
 # Power guards. This is a fanless MacBook Air M2: sustained VL inference is the
 # heaviest sustained load it ever sees, and on battery it will flatten the pack
 # and the machine will simply switch off mid-run. Losing a run is cheap; losing
@@ -73,7 +84,10 @@ else
 fi
 
 BASE_SWAP=$(swap_used_mb)
-echo "[watchdog] nice=${NICE}  baseline swap=${BASE_SWAP}MB  limits: rss<${RSS_LIMIT_MB}MB swap<+${SWAP_GROWTH_MB}MB (once rss>${SWAP_MIN_RSS_MB}MB) free>${FREE_PCT_MIN}%"
+if [ "$POLL" -gt 5 ]; then
+  echo "[watchdog] WARNING: POLL=${POLL}s is too slow to catch a memory collapse; 2s advised."
+fi
+echo "[watchdog] nice=${NICE}  baseline swap=${BASE_SWAP}MB  limits: rss<${RSS_LIMIT_MB}MB swap<+${SWAP_GROWTH_MB}MB (once rss>${SWAP_MIN_RSS_MB}MB) free>${FREE_PCT_MIN}% HARD free>${FREE_PCT_HARD}%"
 
 # Constrain thread pools so the CPU isn't saturated and memory arenas stay small.
 export OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS \
@@ -88,6 +102,7 @@ echo "[watchdog] pid=$CHILD log=$LOG"
 REASON=""
 PEAK=0
 FREE_LOW=0
+HARD_LOW=0
 while kill -0 "$CHILD" 2>/dev/null; do
   # Sum RSS across the child and every descendant, walking the tree rather than
   # one level: pgrep -P returns direct children only, so the tesseract binary a
@@ -126,9 +141,23 @@ while kill -0 "$CHILD" 2>/dev/null; do
   if [ "$SW_DELTA" -gt "$SWAP_GROWTH_MB" ] && [ "$RSS_MB" -gt "$SWAP_MIN_RSS_MB" ]; then
     REASON="swap grew ${SW_DELTA}MB > ${SWAP_GROWTH_MB}MB while child held ${RSS_MB}MB"
   fi
+  # Runaway swap is fatal whether or not we can prove it was us.
+  if [ "$SW_DELTA" -gt $((SWAP_GROWTH_MB * 2)) ]; then
+    REASON="swap grew ${SW_DELTA}MB, more than twice the ${SWAP_GROWTH_MB}MB limit"
+  fi
   # Free memory is system-wide and dips transiently. Require several consecutive
   # violations and a child big enough to be worth blaming, so a brief dip caused
   # by another application does not kill a well-behaved job.
+  # Hard floor: no RSS gate, because RSS cannot see the VL model.
+  if [ "$FP" -lt "$FREE_PCT_HARD" ]; then
+    HARD_LOW=$((HARD_LOW + 1))
+    if [ "$HARD_LOW" -ge "$FREE_HARD_STRIKES" ]; then
+      REASON="free memory ${FP}% < ${FREE_PCT_HARD}% for ${HARD_LOW} samples (hard floor; RSS cannot see MLX Metal buffers)"
+    fi
+  else
+    HARD_LOW=0
+  fi
+
   if [ "$FP" -lt "$FREE_PCT_MIN" ] && [ "$RSS_MB" -gt "$SWAP_MIN_RSS_MB" ]; then
     FREE_LOW=$((FREE_LOW + 1))
     if [ "$FREE_LOW" -ge "$FREE_STRIKES" ]; then
@@ -136,6 +165,7 @@ while kill -0 "$CHILD" 2>/dev/null; do
     fi
   else
     FREE_LOW=0
+HARD_LOW=0
   fi
 
   if [ -n "$REASON" ]; then
