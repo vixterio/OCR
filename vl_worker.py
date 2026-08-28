@@ -198,11 +198,13 @@ def main():
             })
         except Exception as exc:
             _emit({"error": f"{type(exc).__name__}: {exc}"})
-        finally:
-            try:
-                mlx_vlm.clear_mlx_streams()
-            except Exception:
-                pass
+        # Deliberately NOT calling mlx_vlm.clear_mlx_streams() here. It releases
+        # the streams owned by this thread, which is the thread the model's
+        # weights and KV cache are bound to, so the next request fails with
+        #     RuntimeError: There is no Stream(gpu, 1) in current thread.
+        # Adding it turned deepseek+ocr into a two-engine vote: every per-line
+        # VL call errored, the error was swallowed, and the mode reported three
+        # families while using two.
 
     _emit({"bye": True})
 

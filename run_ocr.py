@@ -81,6 +81,15 @@ def main():
     ap.add_argument("--pad", type=int, default=6)
     ap.add_argument("--block-timeout", type=int, default=900)
     ap.add_argument("--allow-gaps", action="store_true")
+    ap.add_argument("--vl-line-reads", dest="vl_line_reads", action="store_true",
+                    default=None,
+                    help="also ask the VL model to re-read every numeric line. "
+                         "Defaults ON for block-granularity models (cheap) and OFF "
+                         "for page-granularity ones, where the model has already "
+                         "read the line as part of the page and the extra calls "
+                         "dominated the run")
+    ap.add_argument("--no-vl-line-reads", dest="vl_line_reads",
+                    action="store_false")
     ap.add_argument("--transport", choices=("auto", "http", "worker"), default="auto",
                     help="auto uses each family's required transport: http for "
                          "PaddleOCR-VL and Qwen (per-token logprobs available), "
@@ -110,11 +119,16 @@ def main():
     max_pixels = args.vl_max_pixels or prof.vl_max_pixels
     outdir = args.outdir or f"output/{args.mode.replace('+', '_')}"
     args.variants = prof.variants
+    if args.vl_line_reads is None:
+        args.vl_line_reads = (spec.granularity == "block")
 
     print(f"mode {args.mode}  |  {spec.family}  |  {spec.granularity}-granularity"
           f"{'  |  numeric vote ON' if verify else '  |  no verification'}")
     print(f"model {model}")
     print(prof.describe())
+    if verify:
+        print(f"per-line VL re-reads: {'on' if args.vl_line_reads else 'off'}"
+              f"{'' if args.vl_line_reads else ' (page model already read the line)'}")
     # The watchdog is a separate process, so hand it the ceiling this profile
     # chose instead of printing a number nothing enforces.
     os.environ.setdefault("RSS_LIMIT_MB", str(prof.rss_limit_mb))
@@ -123,6 +137,22 @@ def main():
     hybrid_ocr.VL_MAX_PIXELS = max_pixels
     transport = None
     vl_fn = None
+
+    # DeepSeek-OCR-2's Metal command buffers time out at any reduced priority:
+    # measured OK at nice 0, and "[METAL] Command buffer execution failed: GPU
+    # Timeout" at nice 5 and nice 10 on identical input. It is also the largest
+    # model here (2.56 GB against PaddleOCR-VL's 0.7 GB). On a fanless machine
+    # those two facts compose badly: the mode can only run by taking the whole
+    # machine, which is worth knowing before starting rather than after.
+    if spec.key == "deepseek":
+        try:
+            current_nice = os.nice(0)
+        except OSError:
+            current_nice = 0
+        if current_nice > 0:
+            print(f"WARNING: running at nice {current_nice}. DeepSeek-OCR-2 fails with "
+                  f"a Metal command-buffer timeout at reduced priority; it needs "
+                  f"nice 0. Re-run with NICE=0, or pick another mode on this hardware.")
 
     if transport_kind == "http":
         loaded = server_models(hybrid_ocr.SERVER_URL)
@@ -169,13 +199,15 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     t0 = time.time()
 
+    from paddleocr import LayoutDetection
+    layout = LayoutDetection(model_name=args.layout_model)
     eng = ocr_core.CpuEngines() if verify else None
     pool = ThreadPoolExecutor(max_workers=max(1, gpu_workers), thread_name_prefix="gpu")
     pages = []
     try:
         for idx, img, dpi, source, chars in hybrid_ocr.iter_input_pages(args.input, args):
             pg = ocr_core.process_page(img, idx, eng, pool, spec, model, verify,
-                                       args, priors, vl_fn=vl_fn)
+                                       args, priors, vl_fn=vl_fn, layout=layout)
             pg.dpi, pg.source = dpi, source
             pages.append(pg)
             flagged = sum(1 for n in pg.numbers if n.get("needs_review"))

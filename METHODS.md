@@ -535,6 +535,16 @@ Assembling model and processor by hand instead produced a Metal command-buffer t
 `mlx_vlm.load` does more than build two objects. `vl_worker.py` therefore substitutes only
 the failing processor step inside mlx-vlm's own loader.
 
+**DeepSeek-OCR-2 is the mode that overloads a fanless machine, and this is not
+fixable from our side.** It needs `nice 0` — measured: it succeeds at normal
+priority and fails with `[METAL] Command buffer execution failed: GPU Timeout` at
+both `nice 5` and `nice 10` on identical input. It is also the largest model here
+(2.56 GB against PaddleOCR-VL's 0.7 GB). Those two facts compose badly: the mode
+can only run by taking the whole machine, and on a passively cooled 8 GB laptop
+that is exactly the load profile that preceded a shutdown. The other five modes
+run acceptably at reduced priority. On this hardware, prefer them; run DeepSeek on
+the larger host.
+
 **Run GPU-bound modes at normal priority.** Metal command buffers have an execution deadline,
 and a niced process cannot always feed the GPU fast enough to meet it. Under `nice 10`
 DeepSeek-OCR-2 failed with `[METAL] Command buffer execution failed: GPU Timeout` on input it

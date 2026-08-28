@@ -31,9 +31,13 @@ POLL=${POLL:-1}
 # and the machine will simply switch off mid-run. Losing a run is cheap; losing
 # the machine mid-write is not, and a half-written audit file is exactly what the
 # atomic writes exist to prevent.
-MIN_BATTERY_PCT=${MIN_BATTERY_PCT:-40}   # refuse to start on battery below this
-ABORT_BATTERY_PCT=${ABORT_BATTERY_PCT:-15}  # stop the child if it drops this low
-REQUIRE_AC=${REQUIRE_AC:-0}              # 1 = refuse to run unless plugged in
+# These do not block work -- the fix for "the machine shut down" is to do less
+# work, not to refuse to work (see the load reductions in run_ocr.py/ocr_core.py).
+# What is left here is a floor that stops a run before the battery reaches the
+# point where the machine dies mid-write, and visibility of the power trajectory.
+REQUIRE_AC=${REQUIRE_AC:-0}              # 1 = refuse unless plugged in
+MIN_BATTERY_PCT=${MIN_BATTERY_PCT:-20}   # refuse to start on battery below this
+ABORT_BATTERY_PCT=${ABORT_BATTERY_PCT:-10}  # stop the child if it drops this low
 THERMAL_MIN=${THERMAL_MIN:-40}           # CPU_Speed_Limit % below which we stop
 
 PY="$(dirname "$0")/.venv/bin/python"
@@ -52,8 +56,10 @@ if on_ac; then
   echo "[watchdog] power: AC connected (battery ${BATT}%)"
 else
   if [ "$REQUIRE_AC" = "1" ]; then
-    echo "[watchdog] REFUSING: REQUIRE_AC=1 and the machine is on battery power."
-    echo "[watchdog] Plug in and retry. VL inference on a fanless Air will drain the pack."
+    echo "[watchdog] REFUSING TO START: on battery power (${BATT}%)."
+    echo "[watchdog] This is a fanless MacBook Air M2 and it has already shut down"
+    echo "[watchdog] mid-run doing exactly this. Plug in and retry."
+    echo "[watchdog] To override for one run: REQUIRE_AC=0 ./safe_run.sh ..."
     exit 3
   fi
   if [ "$BATT" -lt "$MIN_BATTERY_PCT" ]; then

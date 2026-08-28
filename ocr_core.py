@@ -38,6 +38,10 @@ from hybrid_ocr import (CSS, Block, CpuEngines, PageResult, Reading, VLError,
 import hybrid_ocr
 
 
+class SkipVL(Exception):
+    """Raised internally when a per-line VL read was deliberately not requested."""
+
+
 def block_prompt(spec, label: str) -> str:
     """Task prompt for one block, for block-granularity models."""
     bp = spec.block_prompts or {}
@@ -146,7 +150,7 @@ def fill_placeholders(markup: str, slots: list, annotate) -> str:
 
 
 def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args, priors,
-                 vl_fn=None):
+                 vl_fn=None, layout=None):
     """Layout, VL transcription, optional numeric verification, for one page.
 
     `vl_fn(image, prompt, max_tokens) -> VLReply` abstracts the transport, because
@@ -253,8 +257,14 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                     "block": b.index, "label": b.label,
                     "box": (b.box[0] + lx1, b.box[1] + ly1, b.box[0] + lx2, b.box[1] + ly2),
                     "readings": readings, "ppocr_text": p_text, "tesseract_text": t_text,
-                    "vl_future": gpu_pool.submit(vl_fn, line_img, spec.line_prompt,
-                                                 spec.max_tokens_line),
+                    # A page-granularity model has already read this line as part
+                    # of the whole page; asking it again per line cost ~10s each
+                    # on DeepSeek (200s+ of GPU for one page) to re-read text the
+                    # OCR engines had already read twice. Off by default for page
+                    # models, on for block models where the call is cheap.
+                    "vl_future": (gpu_pool.submit(vl_fn, line_img, spec.line_prompt,
+                                                  spec.max_tokens_line)
+                                  if args.vl_line_reads else None),
                 })
 
     if verify:
@@ -343,8 +353,13 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
             vl_text = reply.text
             nl["readings"].append(Reading("vl", numeric.keys(vl_text),
                                           reply.confidence, vl_text))
+        except SkipVL:
+            nl["vl_skipped"] = True
         except Exception as exc:
-            nl["vl_error"] = str(exc)
+            # Record it. Swallowing this is how deepseek+ocr silently became a
+            # two-engine vote while still reporting three families: 0 of 18
+            # numbers carried a VL reading and nothing in the output said so.
+            nl["vl_error"] = f"{type(exc).__name__}: {exc}"
 
         readings = [r for r in nl["readings"] if r.keys]
         n, kept, dropped, notes = reconcile(readings, args.min_families)
@@ -392,13 +407,21 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                                      for r in dropped if r.conf >= args.dissent_floor],
                 "raw_text": {"vl": vl_text, "ppocr": nl["ppocr_text"],
                              "tesseract": nl["tesseract_text"]},
+                "vl_error": nl.get("vl_error"),
+                "vl_line_read_skipped": bool(nl.get("vl_skipped")),
+                "vl_reading_present": any(r.source == "vl" for r in kept + dropped),
                 "needs_review": bool(
                     line_suspect or flags or notes
                     or res["n_families"] < 2
                     or res["margin_frac"] < args.min_margin
                     or any(r.conf >= args.dissent_floor for r in dropped)
                     # An unmeasured VL confidence is not evidence of agreement.
-                    or (not vl_conf_available and len(per_source) < 3)),
+                    or (not vl_conf_available and len(per_source) < 3)
+                    # A VL reading that was *expected* and did not arrive is a
+                    # silent degradation and must be surfaced. One that was
+                    # deliberately not requested is not.
+                    or (args.vl_line_reads
+                        and not any(r.source == "vl" for r in kept + dropped))),
             })
             page.numbers.append(res)
     return page
