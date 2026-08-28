@@ -135,7 +135,35 @@ QWEN = VLSpec(
            "usable ladder is 2B -> 4B -> 9B(Qwen3.5) -> 27B(Qwen3.8)."),
 )
 
-SPECS = {s.key: s for s in (PADDLE, DEEPSEEK, QWEN)}
+GRANITE = VLSpec(
+    key="granite",
+    family="IBM Granite Docling 258M",
+    granularity="page",
+    output="doctags",
+    tiers={
+        # One size exists. At 258M parameters and 0.63 GB it is by a wide margin
+        # the smallest model here -- roughly a quarter of DeepSeek-OCR-2 -- which
+        # is the whole point of it.
+        0: "ibm-granite/granite-docling-258M-mlx",
+    },
+    page_prompt="Convert this page to docling.",
+    line_prompt="Convert this page to docling.",
+    max_tokens_page=8192,
+    max_tokens_line=256,
+    max_pixels=1024 * 28 * 28,
+    notes=("Purpose-built for document conversion and trained to emit DocTags, a "
+           "structured markup with explicit element types and bounding boxes, "
+           "rather than free-form Markdown. docling-core converts that to HTML or "
+           "Markdown deterministically, so layout does not depend on the model "
+           "improvising formatting -- the failure mode where a general VLM invents "
+           "a table shape is not available to it. Built on the Idefics3 "
+           "architecture, which mlx-vlm supports natively, so it needs no worker "
+           "subprocess and no code from the model repository. Its size is its "
+           "risk as well as its virtue: 258M parameters is very small for dense "
+           "or degraded scans."),
+)
+
+SPECS = {s.key: s for s in (PADDLE, DEEPSEEK, QWEN, GRANITE)}
 
 MODES = {
     "paddle":          ("paddle", False),
@@ -144,6 +172,8 @@ MODES = {
     "deepseek+ocr":    ("deepseek", True),
     "qwen":            ("qwen", False),
     "qwen+ocr":        ("qwen", True),
+    "granite":         ("granite", False),
+    "granite+ocr":     ("granite", True),
 }
 
 MODE_HELP = {
@@ -153,6 +183,8 @@ MODE_HELP = {
     "deepseek+ocr": "DeepSeek-OCR-2 + PP-OCRv6 + Tesseract, numbers resolved by vote",
     "qwen": "Qwen3.5-VL alone (page-wise, Markdown)",
     "qwen+ocr": "Qwen3.5-VL + PP-OCRv6 + Tesseract, numbers resolved by vote",
+    "granite": "Granite Docling 258M alone (page-wise, DocTags)",
+    "granite+ocr": "Granite Docling 258M + PP-OCRv6 + Tesseract, numbers by vote",
 }
 
 

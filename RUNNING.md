@@ -81,6 +81,19 @@ and adds no information. If a page reports an existing text layer, the pipeline
 says so and **does not use it**: its provenance is unknown, and trusting a
 stranger's OCR inside a clinical record is worse than redoing the work.
 
+## Granite Docling
+
+```bash
+./start_server.sh granite
+./safe_run.sh run_ocr.py doc.pdf --mode granite       # or granite+ocr
+```
+
+The smallest and fastest model here: 258M parameters, 0.63 GB, 12.5s per page
+measured. It emits DocTags rather than prose, which `docling-core` parses into
+structure deterministically. Requires `docling-core` (in requirements.txt) and the
+patched server launcher, which works around a transformers bug that otherwise
+demands torchvision for a model that does not need it.
+
 ## Compare against the stock pipeline
 
 `baseline_vl.py` runs PaddleOCR-VL exactly as PaddlePaddle intends — no voting, no

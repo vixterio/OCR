@@ -504,7 +504,42 @@ transcription, not a verified record.
 
 ---
 
-## 6b. Three operational traps found while making these run
+## 6a. Granite Docling (modes 7 and 8)
+
+`ibm-granite/granite-docling-258M-mlx` is the fourth model family and the odd one
+out in two respects.
+
+**It is tiny.** 258M parameters, 0.63 GB of weights — roughly a quarter of
+DeepSeek-OCR-2 and a third of Qwen3.5-2B. Measured on the same fixture it is also
+the fastest page model: 12.5s against Qwen's 20.4s and DeepSeek's 20.5s, for 797
+tokens.
+
+**It does not emit prose.** Granite is trained to produce *DocTags*, a structured
+markup with explicit element types and bounding boxes, which `docling-core` parses
+deterministically into a document tree. That is a genuinely different failure
+profile from the other three: the document structure comes from a parser, not from
+the model improvising Markdown, so the failure where a general VLM invents a
+plausible-looking table shape is not available to it. Either the DocTags parse or
+it does not, and a parse failure is loud.
+
+It converts to Markdown before rendering so it flows through exactly the same
+renderer, placeholder escaping and number annotation as DeepSeek and Qwen — one
+HTML path to get right rather than two, and the modes stay comparable.
+
+Measured on the European fixture it read every table value exactly, including
+`1.284,50`, `2 019,75` and `1 073,82`, and handled Polish diacritics (`Zażółć`,
+`Gęślą`) correctly. Its Greek was wrong but closer to the mark than
+PaddleOCR-VL's.
+
+The size is the risk as much as the virtue. 258M parameters is very small for
+degraded or dense scans, and nothing here measures how it degrades — a clean
+synthetic fixture is the easiest case it will ever see.
+
+One operational note: it needs `mlx_server_patched.py`, because transformers
+5.15.1 cannot resolve the Idefics3 PIL image processor and demands torchvision
+for a model that does not need it. See below.
+
+## 6b. Four operational traps found while making these run
 
 These cost real time and are not obvious from any documentation, so they are recorded here.
 
@@ -544,6 +579,16 @@ can only run by taking the whole machine, and on a passively cooled 8 GB laptop
 that is exactly the load profile that preceded a shutdown. The other five modes
 run acceptably at reduced priority. On this hardware, prefer them; run DeepSeek on
 the larger host.
+
+**Granite Docling appears to need torchvision, and does not.** transformers 5.15.1
+maps idefics3 to a PIL backend and a torchvision backend, resolves both through a
+lazy module that yields dummy placeholders when torch is absent, and then reports
+`Could not load any image processor class ... Missing optional dependencies:
+torchvision`. But importing
+`transformers.models.idefics3.image_processing_pil_idefics3` directly yields a
+real, instantiable class with `is_dummy` False (measured). Only the lookup is
+broken. `mlx_server_patched.py` substitutes the real class, which avoids pulling
+torch and torchvision into the MLX environment to satisfy a name-resolution bug.
 
 **Run GPU-bound modes at normal priority.** Metal command buffers have an execution deadline,
 and a niced process cannot always feed the GPU fast enough to meet it. Under `nice 10`

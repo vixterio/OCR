@@ -54,6 +54,35 @@ def block_prompt(spec, label: str) -> str:
     return bp.get("default", spec.line_prompt or "OCR:")
 
 
+def doctags_to_markdown(doctags: str) -> tuple:
+    """Convert Granite Docling's DocTags to Markdown. Returns (markdown, note).
+
+    DocTags is a structured markup with explicit element types and coordinates,
+    not prose, so it must be parsed rather than rendered as text. docling-core
+    does that deterministically, which is the point of the format: the document
+    structure comes from the parser, not from the model improvising Markdown.
+
+    Converting to Markdown rather than straight to HTML is deliberate -- it means
+    Granite's output goes through exactly the same renderer, placeholder escaping
+    and number annotation as DeepSeek's and Qwen's, so the modes stay comparable
+    and there is one HTML path to get right instead of two.
+    """
+    if not doctags or not doctags.strip():
+        return "", "empty DocTags"
+    try:
+        from docling_core.types.doc import DocTagsDocument
+        from docling_core.types.doc.document import DoclingDocument
+    except Exception as exc:
+        # Fail loudly rather than rendering raw DocTags as if it were prose.
+        return "", f"docling-core unavailable ({exc}); DocTags cannot be parsed"
+    try:
+        dt = DocTagsDocument.from_doctags_and_image_pairs([doctags], [None])
+        doc = DoclingDocument.load_from_doctags(dt, document_name="page")
+        return doc.export_to_markdown(), ""
+    except Exception as exc:
+        return "", f"DocTags parse failed: {type(exc).__name__}: {exc}"
+
+
 def _slot(slots: list, text: str) -> str:
     """Reserve a placeholder for text, keyed by index.
 
@@ -215,11 +244,20 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
         try:
             reply = page_future.result(timeout=args.block_timeout)
             account(reply)
-            page.page_markdown = reply.text
+            text = reply.text
+            if spec.output == "doctags":
+                text, note = doctags_to_markdown(text)
+                if note and not text:
+                    for b in blocks:
+                        if b.status == "pending":
+                            b.status, b.note = "failed", f"DocTags not rendered: {note}"
+                    return
+            page.page_markdown = text
             for b in blocks:
                 if b.status == "pending":
-                    b.status = "ok" if reply.text else "empty"
-                    b.note = "" if reply.text else "VL returned no text for the page"
+                    b.status = "ok" if page.page_markdown else "empty"
+                    b.note = ("" if page.page_markdown
+                              else "VL returned no usable content for the page")
             if reply.truncated:
                 for b in blocks:
                     if b.status == "ok":

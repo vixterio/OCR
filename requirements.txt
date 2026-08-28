@@ -13,3 +13,4 @@ opencv-contrib-python==4.10.0.84
 
 # The MLX server lives in a separate env (.venv-mlx, Python 3.12) because mlx
 # needs 3.10+; see requirements-mlx.txt.
+docling-core          # parses Granite Docling DocTags into structure
