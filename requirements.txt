@@ -1,6 +1,8 @@
 # Main env (.venv, Python 3.9) — PaddleOCR client + Tesseract
 paddleocr==3.7.0
 paddlepaddle==3.3.1
+paddlex==3.7.2        # imported directly by hybrid_ocr.py for the OTSL->HTML converter
+pypdfium2==5.13.0     # PDF input; has manylinux x86_64 and aarch64 wheels
 pytesseract==0.3.13
 pillow==11.3.0
 opencv-contrib-python==4.10.0.84

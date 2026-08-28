@@ -38,8 +38,18 @@ REASON=""
 PEAK=0
 FREE_LOW=0
 while kill -0 "$CHILD" 2>/dev/null; do
-  # Sum RSS across the child and every descendant process.
-  PIDS=$(pgrep -P "$CHILD" 2>/dev/null | tr '\n' ' ')
+  # Sum RSS across the child and every descendant, walking the tree rather than
+  # one level: pgrep -P returns direct children only, so the tesseract binary a
+  # worker spawns was previously neither measured nor killed.
+  PIDS=""; FRONTIER="$CHILD"
+  while [ -n "$FRONTIER" ]; do
+    NEXT=""
+    for pp in $FRONTIER; do
+      kids=$(pgrep -P "$pp" 2>/dev/null | tr '\n' ' ')
+      [ -n "$kids" ] && NEXT="$NEXT $kids"
+    done
+    PIDS="$PIDS $NEXT"; FRONTIER="$NEXT"
+  done
   RSS_KB=$(ps -o rss= -p "$CHILD" $PIDS 2>/dev/null | awk '{s+=$1} END {print s+0}')
   [ -z "$RSS_KB" ] || [ "$RSS_KB" = "0" ] && ! kill -0 "$CHILD" 2>/dev/null && break
   RSS_MB=$((RSS_KB / 1024))
@@ -69,7 +79,8 @@ while kill -0 "$CHILD" 2>/dev/null; do
 
   if [ -n "$REASON" ]; then
     echo "[watchdog] TRIPPED: $REASON — killing $CHILD"
-    pkill -9 -P "$CHILD" 2>/dev/null; kill -9 "$CHILD" 2>/dev/null
+    for pp in $PIDS; do kill -9 "$pp" 2>/dev/null; done
+    kill -9 "$CHILD" 2>/dev/null
     wait "$CHILD" 2>/dev/null
     echo "[watchdog] peak RSS ${PEAK}MB. See $LOG"
     exit 99
