@@ -10,6 +10,7 @@ set -uo pipefail
 RSS_LIMIT_MB=${RSS_LIMIT_MB:-4200}     # kill child above this resident size
 SWAP_GROWTH_MB=${SWAP_GROWTH_MB:-700}  # kill if swap grows this much over baseline
 SWAP_MIN_RSS_MB=${SWAP_MIN_RSS_MB:-1500} # ...but only once the child is itself this big
+SWAP_ABS_MB=${SWAP_ABS_MB:-5000}       # absolute swap ceiling; 0 disables
 # RSS IS BLIND TO MLX. A VL worker holding a 2.56 GB model reported 769 MB of
 # tree RSS while system free memory fell to 4% and swap grew 3.5 GB, because MLX
 # allocates through Metal and those buffers are not ordinary anonymous RSS. Every
@@ -123,7 +124,17 @@ while kill -0 "$CHILD" 2>/dev/null; do
   RSS_MB=$((RSS_KB / 1024))
   [ "$RSS_MB" -gt "$PEAK" ] && PEAK=$RSS_MB
 
-  SW=$(swap_used_mb); SW_DELTA=$((SW - BASE_SWAP))
+  SW=$(swap_used_mb)
+  # Track the low-water mark. BASE_SWAP is sampled when this run starts, so a
+  # run that follows a heavy one inherits its high-water mark as the baseline:
+  # as the previous job's pages are reclaimed the delta goes NEGATIVE, and a
+  # negative delta can never exceed a positive limit. That is not hypothetical
+  # -- deepseek+ocr ran its entire life at swap+-1966MB, with the swap guard
+  # dead, and starved the machine until WindowServer hit its userspace watchdog
+  # and the graphical session was killed. Following the baseline down makes the
+  # delta measure this run's growth rather than the last run's leftovers.
+  [ "$SW" -lt "$BASE_SWAP" ] && BASE_SWAP=$SW
+  SW_DELTA=$((SW - BASE_SWAP))
   FP=$(free_pct); FP=${FP:-100}
   BATT=$(battery_pct); BATT=${BATT:-100}
   SL=$(speed_limit); SL=${SL:-100}
@@ -151,6 +162,11 @@ while kill -0 "$CHILD" 2>/dev/null; do
   if [ "$SW_DELTA" -gt $((SWAP_GROWTH_MB * 2)) ]; then
     REASON="swap grew ${SW_DELTA}MB, more than twice the ${SWAP_GROWTH_MB}MB limit"
   fi
+  # Absolute ceiling, which no baseline can poison. Deltas are relative to a
+  # moment that may itself have been unhealthy; this one is not.
+  if [ "$SWAP_ABS_MB" -gt 0 ] && [ "$SW" -gt "$SWAP_ABS_MB" ]; then
+    REASON="swap in use ${SW}MB > ${SWAP_ABS_MB}MB absolute ceiling"
+  fi
   # Free memory is system-wide and dips transiently. Require several consecutive
   # violations and a child big enough to be worth blaming, so a brief dip caused
   # by another application does not kill a well-behaved job.
@@ -171,7 +187,6 @@ while kill -0 "$CHILD" 2>/dev/null; do
     fi
   else
     FREE_LOW=0
-HARD_LOW=0
   fi
 
   if [ -n "$REASON" ]; then

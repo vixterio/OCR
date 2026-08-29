@@ -265,6 +265,12 @@ def score(audit_path: str):
         # and invention both show up here before they show up as a wrong number.
         "length_ratio": w_found / max(1, w_exp),
         "tokens": toks, "tokens_per_page": toks / npages,
+        # Throughput is the honest cost unit for a local model. There is no
+        # per-token bill; what a page costs is a slice of a machine, so the
+        # figure that decides capacity is how many pages one machine clears per
+        # hour. The --rate flag converts tokens into what a hosted VLM would
+        # charge instead, for comparison against buying the capacity.
+        "pages_per_hour": 3600.0 / max(1e-9, (d.get("wall_seconds") or 0.0) / npages),
         "vl_calls": sum(p.get("vl_calls", 0) for p in pages),
         "wall": d.get("wall_seconds") or 0.0,
         "wall_per_page": (d.get("wall_seconds") or 0.0) / npages,
@@ -301,8 +307,8 @@ def main():
         print(f"{'mode':14} {'pages':>5} {'PII':>6} {'foot':>5} {'name':>5} {'dob':>5} {'kvnr':>5} "
               f"{'word R':>7} {'word P':>7} {'txt R':>6} {'txt P':>6} "
               f"{'num R':>6} {'num P':>6} "
-              f"{'tok/pg':>7} {'s/pg':>6}{cost}")
-        print("-" * (115 + len(cost)))
+              f"{'tok/pg':>7} {'s/pg':>6} {'pg/hr':>6}{cost}")
+        print("-" * (122 + len(cost)))
         for r in rows:
             f, g = r["pii_found"], r["pii_fields"]
             nm = (f.get("family", 0) + f.get("given", 0)) / max(1, g.get("family", 0) + g.get("given", 0))
@@ -313,7 +319,8 @@ def main():
                   f"{r['w_recall']*100:6.1f}% {r['w_precision']*100:6.1f}% "
                   f"{r['n_recall']*100:5.1f}% {r['n_precision']*100:5.1f}% "
                   f"{r['r_recall']*100:5.1f}% {r['r_precision']*100:5.1f}% "
-                  f"{r['tokens_per_page']:7.0f} {r['wall_per_page']:6.1f}{c}")
+                  f"{r['tokens_per_page']:7.0f} {r['wall_per_page']:6.1f} "
+                  f"{r['pages_per_hour']:6.0f}{c}")
     else:
         for r in rows:
             print(f"\n{r['mode']}  ({r['model']}, {r['pages']} pages of {r['bundle']})")
