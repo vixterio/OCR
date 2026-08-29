@@ -218,8 +218,15 @@ def main():
     from paddleocr import LayoutDetection
     layout = LayoutDetection(model_name=args.layout_model)
 
+    _engines = {}
+
     def eng_factory():
-        return ocr_core.CpuEngines()
+        # Cached: process_page cannot hand the built engines back (assigning to
+        # its parameter does not reach here), so the cache is what stops a
+        # rebuild per page.
+        if "eng" not in _engines:
+            _engines["eng"] = ocr_core.CpuEngines()
+        return _engines["eng"]
 
     # In sequential mode the OCR engines are built after the VL model has been
     # released, so they are never both resident.

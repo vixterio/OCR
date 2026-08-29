@@ -66,7 +66,10 @@ check("'2 x 500 mg' is a product", [q.kind for q in extract("2 x 500 mg")], ["pr
 check("'range 10-20' no negative", vals("range 10-20"), ["10", "20"])
 
 print("\n=== defect 1.10c: lost-separator flag is per-span, not per-line ===")
-check("'BP 120 80' spans", lost_separator_spans("BP 120 80"), [(5, 9)])
+# The span now starts at the gap rather than at the digit before it: the pattern
+# uses a lookbehind so a legitimate thousands group cannot consume the digit that
+# anchors the next test. Callers use these as a boolean, so the bound is cosmetic.
+check("'BP 120 80' spans", lost_separator_spans("BP 120 80"), [(6, 9)])
 check("'Итого 2 019,75' no span", lost_separator_spans("Итого 2 019,75"), [])
 
 print("\n=== no regression: English fixture (table_sample.png) ===")
@@ -112,6 +115,22 @@ for raw, want in [("140 mg", "140 mg"), ("1000 mg", "1000 mg"), ("100 %", "100%"
     q = extract(raw)[0]
     check(f"display({raw!r})", format_key(q.key), want)
 check("'5.0' and '5' still equal", extract("5.0")[0].key == extract("5")[0].key, True)
+
+print("\n=== silent fabrication paths that had no flag at all ===")
+# A thousands group used to consume the digit anchoring the next test, so a
+# dropped decimal separator right after one was invisible.
+check("'2 019 75' is flagged", bool(lost_separator_spans("2 019 75")), True)
+check("'2 019,75' still not flagged", lost_separator_spans("2 019,75"), [])
+check("'1 000 000' still not flagged", lost_separator_spans("1 000 000"), [])
+# The detector must know every separator normalise() treats as grouping.
+check("apostrophe grouping detected", bool(lost_separator_spans("18'7%")), True)
+check("figure space detected", bool(lost_separator_spans("18\u20077%")), True)
+# The word-boundary guard must cover accented Latin, not just ASCII/Greek/Cyrillic.
+check("'Gęślą987,31' yields nothing", vals("Gęślą987,31"), [])
+check("'Kwartał1' yields nothing", vals("Kwartał1"), [])
+check("'café12' yields nothing", vals("café12"), [])
+check("'B12 450' still yields 450", vals("B12 450"), ["450"])
+check("'HbA1c 6.5' still yields 6.5", vals("HbA1c 6.5"), ["6.5"])
 
 print()
 if FAILURES:

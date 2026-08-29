@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 S = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 out = sys.argv[2] if len(sys.argv) > 2 else f"euro_{int(S)}x.png"
 F = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
-W, H = int(1060 * S), int(470 * S)
+W, H = int(1060 * S), int(510 * S)
 img = Image.new("RGB", (W, H), "white")
 d = ImageDraw.Draw(img)
 fb = ImageFont.truetype(F, int(28 * S))

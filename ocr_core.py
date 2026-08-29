@@ -195,10 +195,16 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
 
     h, w = page_img.shape[:2]
     t0 = time.time()
-    layout = LayoutDetection(model_name=args.layout_model)
+    # Use the predictor the caller built. This function used to construct its own
+    # here, shadowing the parameter, so a "built once per run" fix landed in
+    # run_ocr.py while this line quietly rebuilt one per page -- three
+    # constructions in a two-page run, ~215MB each, on a machine that dies of
+    # memory. Pages are processed serially; a shared Paddle predictor would be
+    # unsafe if that ever changes, since they are not documented thread-safe.
+    if layout is None:
+        layout = LayoutDetection(model_name=args.layout_model)
     lay = next(iter(layout.predict(page_img)))
     record("CPU", "layout", t0, time.time())
-    del layout
 
     blocks: list[Block] = []
     for b in lay["boxes"]:
@@ -349,6 +355,10 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
         if after_vl is not None:
             after_vl()          # releases the VL model before Paddle loads
         if verify and eng is None and eng_factory is not None:
+            # eng_factory caches, because assigning to this parameter does not
+            # reach the caller: the engines were being rebuilt every page, at
+            # ~1.2s and a monotonically growing RSS, which is the very failure
+            # the build-once change was meant to remove.
             eng = eng_factory()
 
     if verify:

@@ -179,7 +179,11 @@ _FRACTION_MAP = {"½": "0.5", "¼": "0.25", "¾": "0.75", "⅓": "0.333", "⅔":
 
 # A bare number must not be glued to a preceding letter or digit, so 'HbA1c' does
 # not yield 1 and 'B12 450' does not become 12450.
-_BARE_RE = re.compile(rf"(?<![0-9A-Za-zͰ-ϿЀ-ӿ.,]){_BARE}")
+# Two fixed-width lookbehinds. The previous class listed ASCII, Greek and
+# Cyrillic but omitted Latin-1 and Latin Extended-A, so the guard that stops
+# "B12 450" becoming 12450 did not apply to any accented Latin script:
+# "Gęślą987,31" yielded 987,31 and "Kwartał1" yielded 1.
+_BARE_RE = re.compile(rf"(?<![0-9.,])(?<![^\W\d_]){_BARE}")
 _UNIT_AFTER = re.compile(rf"\s*({_UNIT_RE})(?![A-Za-z])")
 
 
@@ -259,14 +263,28 @@ def keys(text: str) -> list[str]:
 # 3-digit group, may be a lost decimal separator: '18,7%' misread as '18 7%'.
 # Returns the spans involved so the flag can be attached to the numbers concerned
 # rather than to every number on the line.
-_LOST_SEP = re.compile(r"(\d)[   ]+(\d+)")
+_LOST_SEP = re.compile("(?<=\\d)[" + SPACE_SEPS + "]+(?=(\\d+))")
 
 
 def lost_separator_spans(text: str) -> list[tuple[int, int]]:
+    """Spans where a separator looks lost.
+
+    Two subtleties, both of which produced silent fabrication:
+
+    * The pattern must not CONSUME the digits around the gap. With a consuming
+      match, a legitimate thousands group swallowed the digit that anchors the
+      next test, so "2 019 75" -- a thousands group followed by a *dropped*
+      decimal separator -- was read as 2019 and 75 and flagged as nothing at all.
+      That is worse than the case this function was written for, because it is
+      silent.
+    * The separator class must match the ones normalise() actually treats as
+      grouping. It previously knew about three of six, so "1'073,82" Swiss
+      grouping was normalised but never checked.
+    """
     spans = []
     for m in _LOST_SEP.finditer(text or ""):
-        if len(m.group(2)) != 3:
-            spans.append(m.span())
+        if len(m.group(1)) != 3:
+            spans.append((m.start(), m.end() + len(m.group(1))))
     return spans
 
 
