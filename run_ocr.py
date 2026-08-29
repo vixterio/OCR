@@ -296,8 +296,13 @@ def main():
             "vl_prompt_tokens": p.vl_prompt_tokens,
             "vl_completion_tokens": p.vl_completion_tokens,
             "page_markdown": p.page_markdown,
+            # Block text is kept so block-granularity modes can be scored at all.
+            # PaddleOCR-VL returns per-block text and leaves page_markdown empty,
+            # so an audit without this has nothing to compare against the source
+            # for exactly one of the four model families.
             "blocks": [{"index": b.index, "label": b.label, "box": list(b.box),
-                        "status": b.status, "note": b.note} for b in p.blocks],
+                        "status": b.status, "note": b.note, "text": b.text}
+                       for b in p.blocks],
             "numbers": p.numbers,
         } for p in pages],
     }
