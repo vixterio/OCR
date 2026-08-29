@@ -68,6 +68,25 @@ class VLError(RuntimeError):
     """The VL backend did not honour the contract the vote depends on."""
 
 
+class VLLocalError(VLError):
+    """A failure on this machine, not a breach of the backend's contract.
+
+    Worth its own type because the two want opposite responses. A contract
+    violation is permanent -- a backend that returns no logprobs will keep
+    returning none however often it is asked, so retrying only burns GPU time. A
+    local failure (no memory to encode a PNG, no disk to write it) is usually
+    transient, and one retry is the difference between a recovered page and a
+    silently dropped one.
+
+    Measured: DeepSeek-OCR-2 scored 34% recall on a two-page record, which read
+    as the model being bad at the job. It was not. Page 1 came back perfect --
+    16 of 16 numbers, every separator right. Page 2 failed entirely because the
+    machine was at 2% free memory with 4GB of swap and could not encode a PNG,
+    and the pipeline recorded that as "VL contract violation", blaming the model
+    for the laptop running out of memory.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
@@ -581,6 +600,9 @@ def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResul
         b = blocks[idx]
         try:
             reply = fut.result(timeout=args.block_timeout)
+        except VLLocalError as exc:
+            b.status, b.note = "failed", f"local failure: {exc}"
+            continue
         except VLError as exc:
             b.status, b.note = "failed", f"VL contract violation: {exc}"
             continue

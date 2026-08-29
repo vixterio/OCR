@@ -22,6 +22,7 @@ immediately after the call.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -33,7 +34,8 @@ import time
 
 import cv2
 
-from hybrid_ocr import VLError, VLReply, downscale_for_vl, record
+from hybrid_ocr import (VLError, VLLocalError, VLReply, downscale_for_vl,
+                        record)
 
 
 class WorkerTransport:
@@ -51,17 +53,25 @@ class WorkerTransport:
         self._lock = threading.Lock()
         self._tmp = tempfile.mkdtemp(prefix="vlcrops-")
         os.chmod(self._tmp, 0o700)
-        cmd = [python_bin, script, "--model", model]
+        self._cmd = [python_bin, script, "--model", model]
         if revision:
-            cmd += ["--revision", revision]
+            self._cmd += ["--revision", revision]
         self._err_path = os.environ.get("VL_WORKER_LOG", "vl_worker.err")
-        self._err_file = open(self._err_path, "w", buffering=1)
+        self._startup_timeout = startup_timeout
+        self._restarts = 0
+        self._spawn()
+
+    def _spawn(self) -> None:
+        """Start the worker subprocess and wait for its ready handshake."""
+        self._err_file = open(self._err_path, "a" if self._restarts else "w",
+                              buffering=1)
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            self._cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             # Keep the worker's diagnostics. Discarding them meant a load
             # failure or a Metal error surfaced only as "VL worker exited during
             # startup", which cost hours of guessing.
             stderr=self._err_file, text=True, bufsize=1)
+        model, startup_timeout = self.model, self._startup_timeout
         deadline = time.time() + startup_timeout
         while True:
             if self.proc.poll() is not None:
@@ -83,12 +93,115 @@ class WorkerTransport:
             if time.time() > deadline:
                 raise VLError(f"VL worker did not become ready (model {model})")
 
+    def _write_crop(self, img, path: str, attempts: int = 3) -> None:
+        """Hand one crop to the worker as a file, and say why if that fails.
+
+        cv2.imwrite returns a bare False and discards the reason, which is how a
+        page of a patient record was lost with nothing recorded but "could not
+        write the crop". Encoding to memory and writing the bytes with Python
+        keeps the errno, so ENOSPC (disk full), ENOMEM (no memory to encode) and
+        ENOENT (temp directory gone) can be told apart in the audit instead of
+        all arriving as False.
+
+        Retried because the cause is usually transient. The observed failure was
+        an encode at 2% free memory while 4GB of swap was being written; a second
+        attempt a moment later succeeds, and the alternative is dropping the page
+        silently. A missing temp directory is repaired rather than retried, since
+        waiting will not bring it back.
+        """
+        last = None
+        for attempt in range(attempts):
+            try:
+                ok, buf = cv2.imencode(".png", img)
+                if not ok:
+                    raise OSError(errno.ENOMEM, "PNG encode failed (out of memory?)")
+                os.makedirs(self._tmp, exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(buf.tobytes())
+                return
+            except (OSError, cv2.error) as exc:
+                last = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+        raise VLLocalError(
+            f"could not stage the crop for the VL worker after {attempts} "
+            f"attempts: {last}. This is a failure on this machine, not a bad "
+            f"reply from the model -- check free memory and disk space.")
+
+
+    # Errors that mean the worker is unusable but the request is not at fault.
+    # A Metal command buffer that overran its deadline says the GPU was busy or
+    # the machine was thrashing, not that this page is unreadable -- and MLX
+    # leaves the worker's streams wedged afterwards, so the process has to go.
+    _FATAL_TO_WORKER = ("has exited", "closed its output stream", "timed out after",
+                        "METAL", "Command buffer", "GPU Timeout")
+
     def read(self, image_bgr, prompt: str, max_tokens: int = 1024,
-             timeout: int = 900) -> VLReply:
+             timeout: int = 900, max_restarts: int = 2) -> VLReply:
+        """One page, surviving a worker that dies underneath it.
+
+        DeepSeek-OCR-2 scored 34% recall on a two-page record because a single
+        Metal command-buffer timeout killed the worker on page 1, and page 2 --
+        and every page after it, in a longer document -- then failed with "VL
+        worker has exited". Nothing restarted it. One transient GPU hiccup cost
+        the entire remainder of the document, silently, as a gap in the output.
+
+        Restarting costs a model reload, which is slow, so it is bounded and the
+        page is only retried while the failure is one that indicts the worker
+        rather than the page. A crop that genuinely cannot be read will fail the
+        same way twice, and retrying it forever would be worse than a gap.
+        """
+        last, started = None, self._restarts
+        for attempt in range(max_restarts + 1):
+            gen = self._restarts
+            try:
+                return self._read_once(image_bgr, prompt, max_tokens, timeout)
+            except VLLocalError:
+                raise                      # staging failure; already retried in place
+            except VLError as exc:
+                last = exc
+                if attempt >= max_restarts:
+                    break
+                if not any(m in str(exc) for m in self._FATAL_TO_WORKER):
+                    break                  # the worker is fine; the reply was not
+                sys.stderr.write(
+                    f"VL worker died ({exc}); restarting "
+                    f"({attempt + 1}/{max_restarts}) and retrying the page\n")
+                self._restart(gen)
+        # Report restarts actually performed, not the budget. A permanent
+        # contract violation restarts nothing, and claiming otherwise sends the
+        # reader looking for two model reloads that never happened.
+        done = self._restarts - started
+        raise VLError(f"{last}" + (f" (after {done} worker restart(s))" if done else ""))
+
+    def _restart(self, gen: int) -> None:
+        """Replace the worker, unless another thread already has.
+
+        Without the generation check two callers that failed on the same dead
+        worker would each restart: the first spawns a healthy process and the
+        second immediately kills it. Only one restart per generation.
+        """
+        with self._lock:
+            if self._restarts != gen:
+                return
+            try:
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                self.proc.wait(timeout=20)
+            except Exception:
+                pass
+            try:
+                self._err_file.close()
+            except Exception:
+                pass
+            self._restarts += 1
+            self._spawn()
+
+    def _read_once(self, image_bgr, prompt: str, max_tokens: int = 1024,
+                   timeout: int = 900) -> VLReply:
         img = downscale_for_vl(image_bgr)
         path = os.path.join(self._tmp, f"crop-{threading.get_ident()}-{time.time_ns()}.png")
-        if not cv2.imwrite(path, img):
-            raise VLError("could not write the crop for the VL worker")
+        self._write_crop(img, path)
         try:
             os.chmod(path, 0o600)
             req = json.dumps({"image": path, "prompt": prompt,

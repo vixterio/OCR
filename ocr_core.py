@@ -31,6 +31,7 @@ import cv2
 
 import numeric
 from hybrid_ocr import (CSS, Block, CpuEngines, PageResult, Reading, VLError,
+                        VLLocalError,
                         dedupe_boxes, make_annotator, preprocess_variants,
                         reconcile, record, vl_confidence_by_key, vl_read,
                         write_atomic, _Annotator, IMAGE_LABELS, QUARANTINE_LABELS,
@@ -268,6 +269,14 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                 for b in blocks:
                     if b.status == "ok":
                         b.status, b.note = "truncated", "VL page reply hit max_tokens"
+        except VLLocalError as exc:
+            # Ordered before VLError, which it subclasses. Labelling a local
+            # out-of-memory as a contract violation blames the model for the
+            # machine, and sends the next person to read it debugging the wrong
+            # component.
+            for b in blocks:
+                if b.status == "pending":
+                    b.status, b.note = "failed", f"local failure: {exc}"
         except VLError as exc:
             for b in blocks:
                 if b.status == "pending":
@@ -374,6 +383,9 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
             b = blocks[idx]
             try:
                 reply = fut.result(timeout=args.block_timeout)
+            except VLLocalError as exc:
+                b.status, b.note = "failed", f"local failure: {exc}"
+                continue
             except VLError as exc:
                 b.status, b.note = "failed", f"VL contract violation: {exc}"
                 continue
