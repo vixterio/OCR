@@ -131,9 +131,11 @@ def score(audit_path: str):
                for p in d.get("pages", []))
     return {
         "mode": d.get("mode", "?"),
+        "input": (d.get("input") or "").split("/")[-1],
         "model": (d.get("vl_model") or "").split("/")[-1],
         "verify": d.get("verification"),
         "line_reads": d.get("vl_line_reads"),
+        "collapse": d.get("collapse_families"),
         "pages": per_page,
         "totals": dict(tot),
         "recall": tot["correct"] / tot["expected"] if tot["expected"] else 0.0,
@@ -171,12 +173,13 @@ def main():
         sys.exit("nothing scored")
 
     if args.table:
-        print(f"{'mode':15} {'reads':6} {'recall':>7} {'prec':>7} {'miss':>5} "
+        print(f"{'input':24} {'mode':12} {'reads':6} {'vote':9} {'recall':>7} {'prec':>7} {'miss':>5} "
               f"{'spur':>5} {'review':>6} {'calls':>6} {'tokens':>7} {'wall':>7}")
-        print("-" * 88)
-        for r in sorted(rows, key=lambda x: (x["mode"], str(x["line_reads"]))):
+        print("-" * 118)
+        for r in sorted(rows, key=lambda x: (x["input"], x["mode"], str(x["line_reads"]), str(x["collapse"]))):
             t = r["totals"]
-            print(f"{r['mode']:15} {str(r['line_reads']):6} "
+            vote = {True: "family", False: "per-engine", None: "-"}[r["collapse"]]
+            print(f"{r['input'][:24]:24} {r['mode']:12} {str(r['line_reads']):6} {vote:9} "
                   f"{r['recall']*100:6.1f}% {r['precision']*100:6.1f}% "
                   f"{t['missed']:5} {t['spurious']:5} {t['review']:6} "
                   f"{r['vl_calls']:6} {r['tokens']:7} {r['wall'] or 0:6.1f}s")

@@ -428,25 +428,87 @@ def reconcile(readings: list[Reading], min_families: int = 2):
     return n, kept, dropped, notes
 
 
+def family_ballots(per_source: dict[str, tuple[str, float]]):
+    """One ballot per engine family, split across the values its members read.
+
+    The four PP-OCR preprocessing variants are four looks at the same pixels
+    through the same recogniser, not four witnesses. preprocess_variants has said
+    so in its own docstring since it was written -- "the vote must weight them as
+    one engine family, not as separate engines" -- but the vote never did it, and
+    reconcile's family counting hid how much it mattered.
+
+    Measured on the degraded fixtures: the variants produce 1.00 distinct
+    readings per line on clean input, so on easy pages three of the four carry no
+    information. On heavily degraded input they produce 1.47, and the split is
+    not random -- on the English page at heavy degradation raw and up3x read 100%
+    of the numbers while otsu3x managed 55% and adaptive3x 64%, the two
+    thresholding variants failing together because binarisation removes the same
+    thin strokes both times. Four independent ballots let a correlated pair
+    out-vote the genuinely independent engines and call it a majority.
+
+    A family's ballot is *distributed*, not awarded to its internal winner. That
+    matters for the audit as much as the decision. On a heavily degraded line
+    reading 3.412,66 the family split 0.508/0.492 between 3412.66 and 341266 --
+    a lost decimal point, a hundredfold error in a dose. Handing the whole ballot
+    to the winner erased the loser from `candidates`, which drove margin_frac to
+    1.00 and made a number that squeaked through look unanimous. Splitting the
+    ballot keeps margin_frac at 0.016, which is what actually trips review.
+    """
+    members: dict[str, dict[str, tuple[str, float]]] = defaultdict(dict)
+    for engine, (value, conf) in per_source.items():
+        members[family(engine)][engine] = (value, conf)
+
+    ballots: dict[str, dict[str, float]] = {}
+    agreement: dict[str, float] = {}
+    for fam, group in members.items():
+        weight: dict[str, float] = defaultdict(float)
+        voters = 0
+        for value, conf in group.values():
+            if value is not None:
+                weight[value] += conf
+                voters += 1
+        if not weight:
+            continue
+        total = sum(weight.values()) or 1.0
+        strength = total / voters          # the family's mean confidence
+        ballots[fam] = {v: strength * (w / total) for v, w in weight.items()}
+        agreement[fam] = max(weight.values()) / total
+    return ballots, agreement
+
+
 def vote(per_source: dict[str, tuple[str, float]], priors: dict[str, float],
-         all_values: set[str]):
-    """Confidence-weighted vote over one position.
+         all_values: set[str], collapse_families: bool = True):
+    """Confidence-weighted vote over one position, one ballot per engine family.
 
     `all_values` is every value any reading produced at this position, including
     readings reconciliation rejected, so `unanimous` means what it says.
+
+    collapse_families=False restores the old per-engine ballot, kept so the two
+    can be measured against each other rather than argued about.
     """
     score: dict[str, float] = defaultdict(float)
-    for engine, (value, conf) in per_source.items():
-        if value is None:
-            continue
-        score[value] += priors.get(family(engine), 1.0) * conf
+    ballots, agreement = family_ballots(per_source) if collapse_families else (None, None)
+    if ballots is not None:
+        for fam, dist in ballots.items():
+            for value, w in dist.items():
+                score[value] += priors.get(fam, 1.0) * w
+    else:
+        for engine, (value, conf) in per_source.items():
+            if value is None:
+                continue
+            score[value] += priors.get(family(engine), 1.0) * conf
     if not score:
         return None
     ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
     best, best_w = ranked[0]
     runner_w = ranked[1][1] if len(ranked) > 1 else 0.0
     total = sum(score.values()) or 1.0
-    families = {family(e) for e, (v, _) in per_source.items() if v == best}
+    if ballots is not None:
+        # A family counts as backing `best` when `best` is what most of it read.
+        families = {f for f, d in ballots.items()
+                    if max(d.items(), key=lambda kv: kv[1])[0] == best}
+    else:
+        families = {family(e) for e, (v, _) in per_source.items() if v == best}
     return {
         "value": best,
         "weight": round(best_w, 4),
@@ -455,6 +517,10 @@ def vote(per_source: dict[str, tuple[str, float]], priors: dict[str, float],
         "unanimous": len(all_values) == 1,
         "n_families": len(families),
         "candidates": {v: round(w, 4) for v, w in ranked},
+        # Per-family agreement, so a damped vote can be seen rather than inferred
+        # from a weight that quietly went down.
+        "family_agreement": ({f: round(a, 3) for f, a in agreement.items()}
+                             if agreement is not None else None),
         "readings": {e: {"value": v, "confidence": round(c, 4)}
                      for e, (v, c) in per_source.items()},
     }
@@ -660,7 +726,8 @@ def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResul
             for r in dropped:
                 if k < len(r.keys):
                     seen_values.add(r.keys[k])
-            res = vote(per_source, priors, seen_values)
+            res = vote(per_source, priors, seen_values,
+                       getattr(args, "collapse_families", True))
             if res is None:
                 continue
             quantities = numeric.extract(nl["ppocr_text"])
@@ -975,6 +1042,11 @@ def main():
                     help="engine families required to corroborate a separator merge")
     ap.add_argument("--min-margin", type=float, default=0.15,
                     help="normalised vote margin below which a number needs review")
+    ap.add_argument("--per-engine-vote", dest="collapse_families",
+                    action="store_false", default=True,
+                    help="let every preprocessing variant cast its own ballot, as "
+                         "the vote did before family consensus. Kept so the two can "
+                         "be measured against each other")
     ap.add_argument("--dissent-floor", type=float, default=0.5,
                     help="a dissenting reading below this confidence is recorded in the "
                          "audit but does not by itself demand human review. Uncalibrated: "

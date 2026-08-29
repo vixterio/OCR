@@ -465,7 +465,8 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
             for r in dropped:
                 if k < len(r.keys):
                     seen.add(r.keys[k])
-            res = vote(per_source, priors, seen)
+            res = vote(per_source, priors, seen,
+                       getattr(args, "collapse_families", True))
             if res is None:
                 continue
             if not vl_conf_available and "vl" in per_source:

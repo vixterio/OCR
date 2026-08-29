@@ -81,6 +81,11 @@ def main():
     ap.add_argument("--w-tesseract", type=float, default=1.0)
     ap.add_argument("--min-families", type=int, default=2)
     ap.add_argument("--min-margin", type=float, default=0.15)
+    ap.add_argument("--per-engine-vote", dest="collapse_families",
+                    action="store_false", default=True,
+                    help="let every preprocessing variant cast its own ballot, as "
+                         "the vote did before family consensus. Kept so the two can "
+                         "be measured against each other")
     ap.add_argument("--dissent-floor", type=float, default=0.5)
     ap.add_argument("--pad", type=int, default=6)
     ap.add_argument("--block-timeout", type=int, default=900)
@@ -279,6 +284,7 @@ def main():
         # Recorded so a scored run is unambiguous about which configuration
         # produced it -- the whole point of the comparison.
         "vl_line_reads": bool(args.vl_line_reads),
+        "collapse_families": bool(args.collapse_families),
         "sequential_lanes": bool(args.sequential_lanes),
         "variants": list(args.variants),
         "transport": transport_kind,
