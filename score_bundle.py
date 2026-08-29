@@ -14,17 +14,25 @@ answer different questions:
                pipeline uses, so the number-level score here is comparable to
                the fixture scores in evaluate.py.
 
-Three metrics, because they fail differently:
+Five metrics, because they fail differently:
 
   PII          Did the four identifying fields survive? This is the one that
                decides whether a record can be filed against the right patient.
                A page can be 99% correct and still useless if the 1% was the
-               insurance number.
+               insurance number. Fields not printed on the scored pages are
+               excluded, not counted as failures.
+  footer       Every page ends with "Patient: <name> | geb. <dob> | Dok-ID: ..."
+               and on continuation pages that footer is the only place the
+               patient is named. Tracked alone because a model can drop every
+               footer and still score 92% on words.
   content      Word-level recall and precision against the text layer, order
                independent, because reading order is a layout choice and not an
                OCR error. Precision is what catches a model that pads its output.
-  numbers      Missed and spurious quantities. Silent data loss and silent
-               fabrication, the two failures that matter in a clinical document.
+  transcript   Numbers present in the prose the model wrote.
+  resolved     Numbers the pipeline actually decided on, from the audit. The two
+               differ exactly where the +ocr vote does its work: the prose is the
+               same whether or not a vote ran, so scoring only the prose made
+               granite and granite+ocr tie on every metric by construction.
 
     .venv/bin/python score_bundle.py output/b1_granite/audit.json
     .venv/bin/python score_bundle.py output/b1_*/audit.json --table
@@ -72,6 +80,27 @@ def numbers_in(text: str) -> Counter:
     out = Counter()
     for k in numeric.keys(_MD.sub(" ", text)):
         body = k.split(":")[1] if ":" in k else k
+        for part in body.split("/"):
+            v, _ = numeric.normalise(part)
+            if v is not None:
+                out[v] += 1
+    return out
+
+
+def resolved_numbers(page: dict) -> Counter:
+    """The values the pipeline actually decided on, from the audit.
+
+    Distinct from the numbers in the transcript, and the distinction is the whole
+    point of the +ocr modes. numbers_in() reads the VL model's prose, which is
+    identical whether or not a vote ran; the vote's output lives in the audit's
+    `numbers` array. Scoring only the prose made granite and granite+ocr tie on
+    every metric by construction -- the vote could have corrected or ruined every
+    figure on the page and the score would not have moved.
+    """
+    out = Counter()
+    for rec in page.get("numbers", []):
+        key = rec.get("value") or ""
+        body = key.split(":")[1] if key.count(":") >= 1 else key
         for part in body.split("/"):
             v, _ = numeric.normalise(part)
             if v is not None:
@@ -163,6 +192,7 @@ def score(audit_path: str):
     foot_exp = foot_hit = 0
     w_hit = w_exp = w_found = 0
     n_exp = n_found = n_hit = 0
+    r_found = r_hit = 0
     per_page = []
     for i, page in enumerate(pages):
         t = words(truth[i]) if i < len(truth) else Counter()
@@ -173,6 +203,8 @@ def score(audit_path: str):
         on = numbers_in(page_text(page))
         nh = sum((tn & on).values())
         n_hit += nh; n_exp += sum(tn.values()); n_found += sum(on.values())
+        rn = resolved_numbers(page)
+        r_hit += sum((tn & rn).values()); r_found += sum(rn.values())
         if i < len(truth) and "Dok-ID" in truth[i]:
             foot_exp += 1
             foot_hit += "Dok-ID" in page_text(page)
@@ -223,6 +255,8 @@ def score(audit_path: str):
         "w_recall": w_hit / max(1, w_exp), "w_precision": w_hit / max(1, w_found),
         "n_recall": n_hit / max(1, n_exp), "n_precision": n_hit / max(1, n_found),
         "n_missed": n_exp - n_hit, "n_spurious": n_found - n_hit,
+        "r_recall": r_hit / max(1, n_exp), "r_precision": r_hit / max(1, r_found),
+        "r_missed": n_exp - r_hit, "r_spurious": r_found - r_hit,
         "pii_fields": dict(fields), "pii_found": dict(found), "pii_misses": misses,
         "pii_unreachable": dict(unreachable),
         "pii_rate": sum(found.values()) / max(1, sum(fields.values())),
@@ -265,9 +299,10 @@ def main():
     if args.table:
         cost = f"{'$/1k pg':>8}" if args.rate else ""
         print(f"{'mode':14} {'pages':>5} {'PII':>6} {'foot':>5} {'name':>5} {'dob':>5} {'kvnr':>5} "
-              f"{'word R':>7} {'word P':>7} {'num R':>6} {'num P':>6} "
+              f"{'word R':>7} {'word P':>7} {'txt R':>6} {'txt P':>6} "
+              f"{'num R':>6} {'num P':>6} "
               f"{'tok/pg':>7} {'s/pg':>6}{cost}")
-        print("-" * (101 + len(cost)))
+        print("-" * (115 + len(cost)))
         for r in rows:
             f, g = r["pii_found"], r["pii_fields"]
             nm = (f.get("family", 0) + f.get("given", 0)) / max(1, g.get("family", 0) + g.get("given", 0))
@@ -277,6 +312,7 @@ def main():
                   f"{f.get('kvnr',0)/max(1,g.get('kvnr',1))*100:4.0f}% "
                   f"{r['w_recall']*100:6.1f}% {r['w_precision']*100:6.1f}% "
                   f"{r['n_recall']*100:5.1f}% {r['n_precision']*100:5.1f}% "
+                  f"{r['r_recall']*100:5.1f}% {r['r_precision']*100:5.1f}% "
                   f"{r['tokens_per_page']:7.0f} {r['wall_per_page']:6.1f}{c}")
     else:
         for r in rows:
@@ -291,8 +327,12 @@ def main():
                   f"  output/source length {r['length_ratio']:.2f}x")
             print(f"  footer   {r['footer_rate']*100:.0f}% of {r['footer_exp']} pages "
                   f"(carries the patient identity on continuation pages)")
-            print(f"  numbers  recall {r['n_recall']*100:.1f}%  precision {r['n_precision']*100:.1f}%"
-                  f"  missed {r['n_missed']}  spurious {r['n_spurious']}")
+            print(f"  numbers  transcript recall {r['n_recall']*100:.1f}%  "
+                  f"precision {r['n_precision']*100:.1f}%  "
+                  f"missed {r['n_missed']}  spurious {r['n_spurious']}")
+            print(f"           resolved   recall {r['r_recall']*100:.1f}%  "
+                  f"precision {r['r_precision']*100:.1f}%  "
+                  f"missed {r['r_missed']}  spurious {r['r_spurious']}")
             print(f"  cost     {r['tokens_per_page']:.0f} tokens/page, "
                   f"{r['wall_per_page']:.1f}s/page, {r['vl_calls']} VL calls, "
                   f"{r['review']} flagged, {r['gaps']} gaps")
