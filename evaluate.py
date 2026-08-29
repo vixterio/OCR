@@ -49,9 +49,25 @@ ENG = ["1,284.50", "2,019.75", "3,145.08", "6,449.33",
 # permanently unreachable misses look like a pipeline failure. The euro page's
 # "Kwartał 1" headers ARE listed, because the space makes them reachable.
 
-TRUTH = {"test_record.pdf": [EURO, ENG],
-         "euro_table_sample.png": [EURO],
-         "table_sample.png": [ENG]}
+# Resolved by prefix, not by exact filename, so every degraded variant that
+# degrade.py builds inherits its labels automatically. That is deliberate: the
+# degradations are pure image transforms of these same renders, so the set of
+# numbers on the page cannot have changed, and re-listing them per variant would
+# only create somewhere for a transcription error to hide. Longest prefix first,
+# because "euro_table_heavy" also starts with the "table" of the English page.
+TRUTH_BY_PREFIX = [("euro_table", [EURO]), ("table", [ENG])]
+TRUTH = {"test_record.pdf": [EURO, ENG]}
+
+
+def truth_for(src: str):
+    """Ground truth for an input filename, exact match then prefix."""
+    if src in TRUTH:
+        return TRUTH[src]
+    stem = src.rsplit(".", 1)[0]
+    for prefix, pages in TRUTH_BY_PREFIX:
+        if stem.startswith(prefix):
+            return pages
+    return None
 
 
 def canon(raw: str):
@@ -78,7 +94,7 @@ def value_of(rec):
 def score(audit_path: str):
     d = json.load(open(audit_path, encoding="utf-8"))
     src = (d.get("input") or "").split("/")[-1]
-    truth_pages = TRUTH.get(src)
+    truth_pages = truth_for(src)
     if truth_pages is None:
         return None
 
