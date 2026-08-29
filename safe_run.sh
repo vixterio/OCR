@@ -10,19 +10,85 @@ set -uo pipefail
 RSS_LIMIT_MB=${RSS_LIMIT_MB:-4200}     # kill child above this resident size
 SWAP_GROWTH_MB=${SWAP_GROWTH_MB:-700}  # kill if swap grows this much over baseline
 SWAP_MIN_RSS_MB=${SWAP_MIN_RSS_MB:-1500} # ...but only once the child is itself this big
+SWAP_ABS_MB=${SWAP_ABS_MB:-5000}       # absolute swap ceiling; 0 disables
+# RSS IS BLIND TO MLX. A VL worker holding a 2.56 GB model reported 769 MB of
+# tree RSS while system free memory fell to 4% and swap grew 3.5 GB, because MLX
+# allocates through Metal and those buffers are not ordinary anonymous RSS. Every
+# RSS-gated guard is therefore useless for this workload, which is how a machine
+# shutdown happened with the watchdog running and reporting healthy numbers.
+# So: absolute free memory is NOT an attribution question. Below this floor the
+# machine is in danger whoever caused it, and our job is the one we control.
+FREE_PCT_HARD=${FREE_PCT_HARD:-12}       # stop here regardless of child RSS
+FREE_HARD_STRIKES=${FREE_HARD_STRIKES:-2}
 FREE_PCT_MIN=${FREE_PCT_MIN:-8}        # kill if system free memory drops below this %
 FREE_STRIKES=${FREE_STRIKES:-3}        # ...for this many consecutive samples
 THREADS=${THREADS:-2}
-POLL=${POLL:-1}
+# Priority of the child. Metal command buffers have an execution deadline, and a
+# niced process cannot always feed the GPU fast enough to meet it: DeepSeek-OCR-2
+# failed with "[METAL] Command buffer execution failed: GPU Timeout" under
+# nice 10 and succeeded at normal priority on the same input. So GPU-bound work
+# runs at NICE=0 by default; raise it for CPU-only jobs if you want the machine
+# to stay responsive.
+#
+# Note the interaction with the power guards below: NICE=0 means the run takes
+# the machine's full attention, which on a fanless Air on battery is how it ends
+# up switching off. The two settings are a pair -- if you raise NICE to be kind
+# to the machine, the Metal deadline may bite; if you keep NICE=0, plug in.
+NICE=${NICE:-0}
+# Memory went 14% -> 5% -> 4% free within a few samples during the crash. Polling
+# every 15s, as the comparison matrix did, cannot catch that. Keep it tight.
+POLL=${POLL:-2}
+# Power guards. This is a fanless MacBook Air M2: sustained VL inference is the
+# heaviest sustained load it ever sees, and on battery it will flatten the pack
+# and the machine will simply switch off mid-run. Losing a run is cheap; losing
+# the machine mid-write is not, and a half-written audit file is exactly what the
+# atomic writes exist to prevent.
+# These do not block work -- the fix for "the machine shut down" is to do less
+# work, not to refuse to work (see the load reductions in run_ocr.py/ocr_core.py).
+# What is left here is a floor that stops a run before the battery reaches the
+# point where the machine dies mid-write, and visibility of the power trajectory.
+REQUIRE_AC=${REQUIRE_AC:-0}              # 1 = refuse unless plugged in
+MIN_BATTERY_PCT=${MIN_BATTERY_PCT:-20}   # refuse to start on battery below this
+ABORT_BATTERY_PCT=${ABORT_BATTERY_PCT:-10}  # stop the child if it drops this low
+THERMAL_MIN=${THERMAL_MIN:-40}           # CPU_Speed_Limit % below which we stop
 
 PY="$(dirname "$0")/.venv/bin/python"
 LOG="${LOG:-/tmp/safe_run_$$.log}"
 
+on_ac()      { pmset -g batt 2>/dev/null | grep -q "AC Power"; }
+battery_pct() { pmset -g batt 2>/dev/null | grep -oE "[0-9]+%" | head -1 | tr -d '%'; }
+speed_limit() { pmset -g therm 2>/dev/null | grep -oE "CPU_Speed_Limit[[:space:]]*=[[:space:]]*[0-9]+" | grep -oE "[0-9]+$"; }
+
 swap_used_mb() { sysctl -n vm.swapusage | sed -E 's/.*used = ([0-9.]+)M.*/\1/' | cut -d. -f1; }
 free_pct()     { memory_pressure 2>/dev/null | sed -nE 's/.*free percentage: ([0-9]+)%.*/\1/p' | tail -1; }
 
+# ---- pre-flight power check -------------------------------------------------
+BATT=$(battery_pct); BATT=${BATT:-100}
+if on_ac; then
+  echo "[watchdog] power: AC connected (battery ${BATT}%)"
+else
+  if [ "$REQUIRE_AC" = "1" ]; then
+    echo "[watchdog] REFUSING TO START: on battery power (${BATT}%)."
+    echo "[watchdog] This is a fanless MacBook Air M2 and it has already shut down"
+    echo "[watchdog] mid-run doing exactly this. Plug in and retry."
+    echo "[watchdog] To override for one run: REQUIRE_AC=0 ./safe_run.sh ..."
+    exit 3
+  fi
+  if [ "$BATT" -lt "$MIN_BATTERY_PCT" ]; then
+    echo "[watchdog] REFUSING: on battery at ${BATT}%, below MIN_BATTERY_PCT=${MIN_BATTERY_PCT}."
+    echo "[watchdog] Sustained VL inference has already shut this machine down once."
+    echo "[watchdog] Plug in, or lower MIN_BATTERY_PCT if you accept the risk."
+    exit 3
+  fi
+  echo "[watchdog] power: ON BATTERY at ${BATT}% -- will stop the child below ${ABORT_BATTERY_PCT}%."
+  echo "[watchdog] Plugging in is strongly advised for multi-page or multi-mode runs."
+fi
+
 BASE_SWAP=$(swap_used_mb)
-echo "[watchdog] baseline swap=${BASE_SWAP}MB  limits: rss<${RSS_LIMIT_MB}MB swap<+${SWAP_GROWTH_MB}MB (once rss>${SWAP_MIN_RSS_MB}MB) free>${FREE_PCT_MIN}%"
+if [ "$POLL" -gt 5 ]; then
+  echo "[watchdog] WARNING: POLL=${POLL}s is too slow to catch a memory collapse; 2s advised."
+fi
+echo "[watchdog] nice=${NICE}  baseline swap=${BASE_SWAP}MB  limits: rss<${RSS_LIMIT_MB}MB swap<+${SWAP_GROWTH_MB}MB (once rss>${SWAP_MIN_RSS_MB}MB) free>${FREE_PCT_MIN}% HARD free>${FREE_PCT_HARD}%"
 
 # Constrain thread pools so the CPU isn't saturated and memory arenas stay small.
 export OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS \
@@ -30,13 +96,16 @@ export OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$T
        CPU_NUM=$THREADS FLAGS_use_mkldnn=0 TOKENIZERS_PARALLELISM=false \
        PYTORCH_ENABLE_MPS_FALLBACK=1
 
-nice -n 10 "$PY" "$@" > "$LOG" 2>&1 &
+nice -n "$NICE" "$PY" "$@" > "$LOG" 2>&1 &
 CHILD=$!
 echo "[watchdog] pid=$CHILD log=$LOG"
 
 REASON=""
 PEAK=0
+MIN_FREE=100
+MAX_SWAP=0
 FREE_LOW=0
+HARD_LOW=0
 while kill -0 "$CHILD" 2>/dev/null; do
   # Sum RSS across the child and every descendant, walking the tree rather than
   # one level: pgrep -P returns direct children only, so the tesseract binary a
@@ -55,8 +124,32 @@ while kill -0 "$CHILD" 2>/dev/null; do
   RSS_MB=$((RSS_KB / 1024))
   [ "$RSS_MB" -gt "$PEAK" ] && PEAK=$RSS_MB
 
-  SW=$(swap_used_mb); SW_DELTA=$((SW - BASE_SWAP))
+  SW=$(swap_used_mb)
+  # Track the low-water mark. BASE_SWAP is sampled when this run starts, so a
+  # run that follows a heavy one inherits its high-water mark as the baseline:
+  # as the previous job's pages are reclaimed the delta goes NEGATIVE, and a
+  # negative delta can never exceed a positive limit. That is not hypothetical
+  # -- deepseek+ocr ran its entire life at swap+-1966MB, with the swap guard
+  # dead, and starved the machine until WindowServer hit its userspace watchdog
+  # and the graphical session was killed. Following the baseline down makes the
+  # delta measure this run's growth rather than the last run's leftovers.
+  [ "$SW" -lt "$BASE_SWAP" ] && BASE_SWAP=$SW
+  SW_DELTA=$((SW - BASE_SWAP))
   FP=$(free_pct); FP=${FP:-100}
+  BATT=$(battery_pct); BATT=${BATT:-100}
+  SL=$(speed_limit); SL=${SL:-100}
+  # Recorded here, after FP and SW_DELTA exist: these two track a crash, peak RSS
+  # does not, because MLX Metal buffers are not anonymous RSS.
+  [ "$FP" -lt "$MIN_FREE" ] && MIN_FREE=$FP
+  [ "$SW_DELTA" -gt "$MAX_SWAP" ] && MAX_SWAP=$SW_DELTA
+
+  # Power and heat are the two ways this machine dies rather than merely slows.
+  if ! on_ac && [ "$BATT" -lt "$ABORT_BATTERY_PCT" ]; then
+    REASON="battery ${BATT}% < ${ABORT_BATTERY_PCT}% on battery power"
+  fi
+  if [ "$SL" -lt "$THERMAL_MIN" ]; then
+    REASON="CPU speed limit ${SL}% < ${THERMAL_MIN}% (thermal throttling)"
+  fi
 
   if [ "$RSS_MB" -gt "$RSS_LIMIT_MB" ]; then REASON="RSS ${RSS_MB}MB > ${RSS_LIMIT_MB}MB"; fi
   # Swap is a system-wide number. On a machine already under pressure from other
@@ -65,9 +158,28 @@ while kill -0 "$CHILD" 2>/dev/null; do
   if [ "$SW_DELTA" -gt "$SWAP_GROWTH_MB" ] && [ "$RSS_MB" -gt "$SWAP_MIN_RSS_MB" ]; then
     REASON="swap grew ${SW_DELTA}MB > ${SWAP_GROWTH_MB}MB while child held ${RSS_MB}MB"
   fi
+  # Runaway swap is fatal whether or not we can prove it was us.
+  if [ "$SW_DELTA" -gt $((SWAP_GROWTH_MB * 2)) ]; then
+    REASON="swap grew ${SW_DELTA}MB, more than twice the ${SWAP_GROWTH_MB}MB limit"
+  fi
+  # Absolute ceiling, which no baseline can poison. Deltas are relative to a
+  # moment that may itself have been unhealthy; this one is not.
+  if [ "$SWAP_ABS_MB" -gt 0 ] && [ "$SW" -gt "$SWAP_ABS_MB" ]; then
+    REASON="swap in use ${SW}MB > ${SWAP_ABS_MB}MB absolute ceiling"
+  fi
   # Free memory is system-wide and dips transiently. Require several consecutive
   # violations and a child big enough to be worth blaming, so a brief dip caused
   # by another application does not kill a well-behaved job.
+  # Hard floor: no RSS gate, because RSS cannot see the VL model.
+  if [ "$FP" -lt "$FREE_PCT_HARD" ]; then
+    HARD_LOW=$((HARD_LOW + 1))
+    if [ "$HARD_LOW" -ge "$FREE_HARD_STRIKES" ]; then
+      REASON="free memory ${FP}% < ${FREE_PCT_HARD}% for ${HARD_LOW} samples (hard floor; RSS cannot see MLX Metal buffers)"
+    fi
+  else
+    HARD_LOW=0
+  fi
+
   if [ "$FP" -lt "$FREE_PCT_MIN" ] && [ "$RSS_MB" -gt "$SWAP_MIN_RSS_MB" ]; then
     FREE_LOW=$((FREE_LOW + 1))
     if [ "$FREE_LOW" -ge "$FREE_STRIKES" ]; then
@@ -85,10 +197,14 @@ while kill -0 "$CHILD" 2>/dev/null; do
     echo "[watchdog] peak RSS ${PEAK}MB. See $LOG"
     exit 99
   fi
-  printf "[watchdog] rss=%sMB peak=%sMB swap+%sMB free=%s%%\n" "$RSS_MB" "$PEAK" "$SW_DELTA" "$FP"
+  printf "[watchdog] rss=%sMB peak=%sMB swap+%sMB free=%s%% batt=%s%% cpu=%s%%\n" \
+         "$RSS_MB" "$PEAK" "$SW_DELTA" "$FP" "$BATT" "$SL"
   sleep "$POLL"
 done
 
 wait "$CHILD"; RC=$?
-echo "[watchdog] child exited rc=$RC, peak RSS ${PEAK}MB. Log: $LOG"
+# Peak RSS understates the true footprint by the whole model size, because MLX
+# Metal buffers are not anonymous RSS. Minimum free memory and maximum swap
+# growth are the two signals that actually track a crash, so record them too.
+echo "[watchdog] child exited rc=$RC, peak RSS ${PEAK}MB, min free ${MIN_FREE}%, max swap +${MAX_SWAP}MB. Log: $LOG"
 exit $RC

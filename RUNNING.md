@@ -81,6 +81,19 @@ and adds no information. If a page reports an existing text layer, the pipeline
 says so and **does not use it**: its provenance is unknown, and trusting a
 stranger's OCR inside a clinical record is worse than redoing the work.
 
+## Granite Docling
+
+```bash
+./start_server.sh granite
+./safe_run.sh run_ocr.py doc.pdf --mode granite       # or granite+ocr
+```
+
+The smallest and fastest model here: 258M parameters, 0.63 GB, 12.5s per page
+measured. It emits DocTags rather than prose, which `docling-core` parses into
+structure deterministically. Requires `docling-core` (in requirements.txt) and the
+patched server launcher, which works around a transformers bug that otherwise
+demands torchvision for a model that does not need it.
+
 ## Compare against the stock pipeline
 
 `baseline_vl.py` runs PaddleOCR-VL exactly as PaddlePaddle intends — no voting, no
@@ -115,6 +128,45 @@ VL_SERVER_URL=http://gpu-host:8000/v1 ./safe_run.sh baseline_vl.py doc.pdf \
 dose corruption, naked leading decimals, units, ranges, dates, fractions, and the
 English and European fixture values. Run it before and after any edit to
 `numeric.py`.
+
+## Power: plug in before running
+
+This is a **fanless MacBook Air M2**. Sustained VL inference is the heaviest load
+it ever sees, and running it on battery has shut the machine down mid-run. The
+watchdog now refuses to start on battery below 40%, stops the child below 15%,
+and aborts if the CPU speed limit indicates thermal throttling:
+
+```bash
+REQUIRE_AC=1 ./safe_run.sh run_ocr.py doc.pdf --mode qwen+ocr   # refuse unless plugged in
+MIN_BATTERY_PCT=60 ./safe_run.sh ...                            # stricter floor
+```
+
+`run_all_modes.sh` warns up front if you are on battery and inserts a 45s
+cool-down between modes (`COOLDOWN=0` to disable), because six sequential
+multi-gigabyte model loads is where the trouble happened.
+
+Do not use `caffeinate` to keep the machine awake during these runs. Preventing
+sleep while a fanless laptop is under sustained GPU load removes the last thing
+that would have saved it.
+
+## Reducing the load
+
+Two changes cut the work substantially, and both are on by default:
+
+- The layout predictor is built **once** per run, not once per page. Rebuilding a
+  Paddle predictor per page was pure waste, and `del` does not deterministically
+  free the native allocation, so it was also the likeliest trigger of the memory
+  watchdog on a long document.
+- Per-line VL re-reads are **off for page-granularity models** (DeepSeek, Qwen).
+  Those models have already read the line as part of the whole page, so asking
+  again per line cost ~10s each on DeepSeek — over 200s of GPU for a single page —
+  to re-read text the OCR engines had read twice already. Measured effect on
+  `deepseek+ocr`: 334s to 124s wall. Force it back on with `--vl-line-reads`.
+
+**DeepSeek-OCR-2 needs `nice 0`.** It fails with a Metal command-buffer timeout at
+`nice 5` and `nice 10`, and it is the largest model here, so it can only run by
+taking the whole machine. On a fanless Air, prefer the other five modes and run
+DeepSeek on a bigger host. `run_ocr.py` warns if you start it at reduced priority.
 
 ## Known limits
 

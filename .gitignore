@@ -5,3 +5,19 @@ output/
 *.pid
 __pycache__/
 *.pyc
+*.wd
+*.watchdog
+vl_worker.err
+matrix.out
+
+# Document corpora and anything derived from them. Synthetic or not, these are
+# patient-shaped records -- names, dates of birth, insurance numbers -- and they
+# do not belong in a public repository. The ignore covers the bundles, their
+# manifests, and every scored result, because a score file quotes the text it
+# scored.
+merged_bundles/
+*.pdf
+!test_record.pdf
+manifest.json
+bulk_upload_manifest.json
+scores/

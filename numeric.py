@@ -66,13 +66,24 @@ class Quantity:
         together, but `values` keeps the surface form so the precision difference
         is still visible in the audit.
         """
-        nums = []
-        for v in self.values:
-            try:
-                nums.append(str(Decimal(v).normalize()))
-            except InvalidOperation:
-                nums.append(v)
-        return f"{self.kind}:{'/'.join(nums)}:{self.unit or ''}"
+        return f"{self.kind}:{'/'.join(_canonical(v) for v in self.values)}:{self.unit or ''}"
+
+
+def _canonical(v: str) -> str:
+    """Canonical numeric form for comparison, without scientific notation.
+
+    `Decimal("140").normalize()` is `1.4E+2`, so a sodium of 140 was reaching the
+    audit and the clinician's tooltip as "1.4E+2". Integral values are re-quantised
+    to a plain integer; fractional values keep normalise's trailing-zero collapse
+    so that '5.0' and '5' still compare equal.
+    """
+    try:
+        d = Decimal(v)
+    except InvalidOperation:
+        return v
+    if d == d.to_integral_value():
+        return str(d.quantize(Decimal(1)))
+    return str(d.normalize())
 
 
 def _decimal_or_none(s: str):
@@ -119,8 +130,17 @@ def normalise(raw: str) -> tuple[str | None, list[str]]:
         s = s.replace("," if dec == "." else ".", "").replace(dec, ".")
     elif has_comma:
         parts = s.split(",")
-        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and parts[0]):
-            s = s.replace(",", "")            # grouping
+        if len(parts) > 2:
+            s = s.replace(",", "")            # 1,284,567 -- multiple groups
+        elif (len(parts) == 2 and len(parts[1]) == 3 and parts[0]
+              and parts[0][0] != "0"):
+            # Same guard as the dot branch below, and for the same reason: without
+            # the leading-zero test '0,125' became '0125', a thousand-fold dose
+            # error on a number written the European way. Three decimal places are
+            # routine in clinical dosing, and an integer part of '0' can never be
+            # a thousands group.
+            s = s.replace(",", "")
+            flags.append("ambiguous_thousands")
         else:
             s = s.replace(",", ".")           # decimal comma
     elif has_dot:
@@ -159,7 +179,11 @@ _FRACTION_MAP = {"½": "0.5", "¼": "0.25", "¾": "0.75", "⅓": "0.333", "⅔":
 
 # A bare number must not be glued to a preceding letter or digit, so 'HbA1c' does
 # not yield 1 and 'B12 450' does not become 12450.
-_BARE_RE = re.compile(rf"(?<![0-9A-Za-zͰ-ϿЀ-ӿ.,]){_BARE}")
+# Two fixed-width lookbehinds. The previous class listed ASCII, Greek and
+# Cyrillic but omitted Latin-1 and Latin Extended-A, so the guard that stops
+# "B12 450" becoming 12450 did not apply to any accented Latin script:
+# "Gęślą987,31" yielded 987,31 and "Kwartał1" yielded 1.
+_BARE_RE = re.compile(rf"(?<![0-9.,])(?<![^\W\d_]){_BARE}")
 _UNIT_AFTER = re.compile(rf"\s*({_UNIT_RE})(?![A-Za-z])")
 
 
@@ -239,14 +263,28 @@ def keys(text: str) -> list[str]:
 # 3-digit group, may be a lost decimal separator: '18,7%' misread as '18 7%'.
 # Returns the spans involved so the flag can be attached to the numbers concerned
 # rather than to every number on the line.
-_LOST_SEP = re.compile(r"(\d)[   ]+(\d+)")
+_LOST_SEP = re.compile("(?<=\\d)[" + SPACE_SEPS + "]+(?=(\\d+))")
 
 
 def lost_separator_spans(text: str) -> list[tuple[int, int]]:
+    """Spans where a separator looks lost.
+
+    Two subtleties, both of which produced silent fabrication:
+
+    * The pattern must not CONSUME the digits around the gap. With a consuming
+      match, a legitimate thousands group swallowed the digit that anchors the
+      next test, so "2 019 75" -- a thousands group followed by a *dropped*
+      decimal separator -- was read as 2019 and 75 and flagged as nothing at all.
+      That is worse than the case this function was written for, because it is
+      silent.
+    * The separator class must match the ones normalise() actually treats as
+      grouping. It previously knew about three of six, so "1'073,82" Swiss
+      grouping was normalised but never checked.
+    """
     spans = []
     for m in _LOST_SEP.finditer(text or ""):
-        if len(m.group(2)) != 3:
-            spans.append(m.span())
+        if len(m.group(1)) != 3:
+            spans.append((m.start(), m.end() + len(m.group(1))))
     return spans
 
 

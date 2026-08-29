@@ -68,6 +68,25 @@ class VLError(RuntimeError):
     """The VL backend did not honour the contract the vote depends on."""
 
 
+class VLLocalError(VLError):
+    """A failure on this machine, not a breach of the backend's contract.
+
+    Worth its own type because the two want opposite responses. A contract
+    violation is permanent -- a backend that returns no logprobs will keep
+    returning none however often it is asked, so retrying only burns GPU time. A
+    local failure (no memory to encode a PNG, no disk to write it) is usually
+    transient, and one retry is the difference between a recovered page and a
+    silently dropped one.
+
+    Measured: DeepSeek-OCR-2 scored 34% recall on a two-page record, which read
+    as the model being bad at the job. It was not. Page 1 came back perfect --
+    16 of 16 numbers, every separator right. Page 2 failed entirely because the
+    machine was at 2% free memory with 4GB of swap and could not encode a PNG,
+    and the pipeline recorded that as "VL contract violation", blaming the model
+    for the laptop running out of memory.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
@@ -141,10 +160,17 @@ class VLReply:
     truncated: bool
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # False when the backend cannot supply per-token logprobs at all. The vote
+    # must then treat the VL reading as evidence without a confidence, rather
+    # than silently assigning it one -- assigning one is how a missing signal
+    # became "confidence 1.00" in an earlier version of this code.
+    confidence_available: bool = True
 
 
 def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
-            timeout: int = 300, require_logprobs: bool = True) -> VLReply:
+            timeout: int = 300, require_logprobs: bool = True,
+            prompt: str | None = None, model: str | None = None,
+            strip_patterns: tuple = ()) -> VLReply:
     """Transcribe one crop. Raises VLError if the backend breaks the contract.
 
     Two silent failures are deliberately made loud here. A per-token entry with no
@@ -160,10 +186,10 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
         raise VLError("could not PNG-encode the crop")
     b64 = base64.b64encode(buf.tobytes()).decode()
     payload = {
-        "model": VL_MODEL,
+        "model": model or VL_MODEL,
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            {"type": "text", "text": prompt_for(label)},
+            {"type": "text", "text": prompt if prompt is not None else prompt_for(label)},
         ]}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -201,6 +227,9 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
                           "treat absent evidence as confidence 1.00")
         toks.append((e.get("token", ""), math.exp(e["logprob"])))
 
+    for pat in strip_patterns:
+        text = re.sub(pat, "", text, flags=re.MULTILINE | re.DOTALL)
+    text = text.strip()
     conf = sum(c for _, c in toks) / len(toks) if toks else 0.0
     usage = data.get("usage") or {}
     return VLReply(text, conf, toks, finish == "length",
@@ -249,6 +278,13 @@ def preprocess_variants(img):
     yield "up3x", cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
     _, otsu = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     yield "otsu3x", cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+    # Otsu picks one global threshold, which loses thin strokes where a scan's
+    # brightness drifts across the page -- common with photocopies and fax. An
+    # adaptive threshold decides locally, so it keeps a faint comma that a global
+    # cut would drop. Only enabled on machines with headroom for the extra reads.
+    adaptive = cv2.adaptiveThreshold(up, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 31, 10)
+    yield "adaptive3x", cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)
 
 
 def dedupe_boxes(boxes, iou_thresh: float = 0.5):
@@ -392,25 +428,87 @@ def reconcile(readings: list[Reading], min_families: int = 2):
     return n, kept, dropped, notes
 
 
+def family_ballots(per_source: dict[str, tuple[str, float]]):
+    """One ballot per engine family, split across the values its members read.
+
+    The four PP-OCR preprocessing variants are four looks at the same pixels
+    through the same recogniser, not four witnesses. preprocess_variants has said
+    so in its own docstring since it was written -- "the vote must weight them as
+    one engine family, not as separate engines" -- but the vote never did it, and
+    reconcile's family counting hid how much it mattered.
+
+    Measured on the degraded fixtures: the variants produce 1.00 distinct
+    readings per line on clean input, so on easy pages three of the four carry no
+    information. On heavily degraded input they produce 1.47, and the split is
+    not random -- on the English page at heavy degradation raw and up3x read 100%
+    of the numbers while otsu3x managed 55% and adaptive3x 64%, the two
+    thresholding variants failing together because binarisation removes the same
+    thin strokes both times. Four independent ballots let a correlated pair
+    out-vote the genuinely independent engines and call it a majority.
+
+    A family's ballot is *distributed*, not awarded to its internal winner. That
+    matters for the audit as much as the decision. On a heavily degraded line
+    reading 3.412,66 the family split 0.508/0.492 between 3412.66 and 341266 --
+    a lost decimal point, a hundredfold error in a dose. Handing the whole ballot
+    to the winner erased the loser from `candidates`, which drove margin_frac to
+    1.00 and made a number that squeaked through look unanimous. Splitting the
+    ballot keeps margin_frac at 0.016, which is what actually trips review.
+    """
+    members: dict[str, dict[str, tuple[str, float]]] = defaultdict(dict)
+    for engine, (value, conf) in per_source.items():
+        members[family(engine)][engine] = (value, conf)
+
+    ballots: dict[str, dict[str, float]] = {}
+    agreement: dict[str, float] = {}
+    for fam, group in members.items():
+        weight: dict[str, float] = defaultdict(float)
+        voters = 0
+        for value, conf in group.values():
+            if value is not None:
+                weight[value] += conf
+                voters += 1
+        if not weight:
+            continue
+        total = sum(weight.values()) or 1.0
+        strength = total / voters          # the family's mean confidence
+        ballots[fam] = {v: strength * (w / total) for v, w in weight.items()}
+        agreement[fam] = max(weight.values()) / total
+    return ballots, agreement
+
+
 def vote(per_source: dict[str, tuple[str, float]], priors: dict[str, float],
-         all_values: set[str]):
-    """Confidence-weighted vote over one position.
+         all_values: set[str], collapse_families: bool = True):
+    """Confidence-weighted vote over one position, one ballot per engine family.
 
     `all_values` is every value any reading produced at this position, including
     readings reconciliation rejected, so `unanimous` means what it says.
+
+    collapse_families=False restores the old per-engine ballot, kept so the two
+    can be measured against each other rather than argued about.
     """
     score: dict[str, float] = defaultdict(float)
-    for engine, (value, conf) in per_source.items():
-        if value is None:
-            continue
-        score[value] += priors.get(family(engine), 1.0) * conf
+    ballots, agreement = family_ballots(per_source) if collapse_families else (None, None)
+    if ballots is not None:
+        for fam, dist in ballots.items():
+            for value, w in dist.items():
+                score[value] += priors.get(fam, 1.0) * w
+    else:
+        for engine, (value, conf) in per_source.items():
+            if value is None:
+                continue
+            score[value] += priors.get(family(engine), 1.0) * conf
     if not score:
         return None
     ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
     best, best_w = ranked[0]
     runner_w = ranked[1][1] if len(ranked) > 1 else 0.0
     total = sum(score.values()) or 1.0
-    families = {family(e) for e, (v, _) in per_source.items() if v == best}
+    if ballots is not None:
+        # A family counts as backing `best` when `best` is what most of it read.
+        families = {f for f, d in ballots.items()
+                    if max(d.items(), key=lambda kv: kv[1])[0] == best}
+    else:
+        families = {family(e) for e, (v, _) in per_source.items() if v == best}
     return {
         "value": best,
         "weight": round(best_w, 4),
@@ -419,6 +517,10 @@ def vote(per_source: dict[str, tuple[str, float]], priors: dict[str, float],
         "unanimous": len(all_values) == 1,
         "n_families": len(families),
         "candidates": {v: round(w, 4) for v, w in ranked},
+        # Per-family agreement, so a damped vote can be seen rather than inferred
+        # from a weight that quietly went down.
+        "family_agreement": ({f: round(a, 3) for f, a in agreement.items()}
+                             if agreement is not None else None),
         "readings": {e: {"value": v, "confidence": round(c, 4)}
                      for e, (v, c) in per_source.items()},
     }
@@ -450,11 +552,14 @@ class PageResult:
     vl_prompt_tokens: int = 0
     vl_completion_tokens: int = 0
     vl_calls: int = 0
+    page_markdown: str = ""      # set by page-granularity VL models
 
     @property
     def incomplete(self) -> list[Block]:
+        # 'empty' belongs here: a VL reply with no text used to leave every block
+        # marked empty, render nothing, and report "0 regions not transcribed".
         return [b for b in self.blocks
-                if b.status in ("failed", "truncated", "quarantined")]
+                if b.status in ("failed", "truncated", "quarantined", "empty")]
 
 
 def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResult:
@@ -561,6 +666,9 @@ def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResul
         b = blocks[idx]
         try:
             reply = fut.result(timeout=args.block_timeout)
+        except VLLocalError as exc:
+            b.status, b.note = "failed", f"local failure: {exc}"
+            continue
         except VLError as exc:
             b.status, b.note = "failed", f"VL contract violation: {exc}"
             continue
@@ -618,7 +726,8 @@ def process_page(page_img, page_index, eng, gpu_pool, args, priors) -> PageResul
             for r in dropped:
                 if k < len(r.keys):
                     seen_values.add(r.keys[k])
-            res = vote(per_source, priors, seen_values)
+            res = vote(per_source, priors, seen_values,
+                       getattr(args, "collapse_families", True))
             if res is None:
                 continue
             quantities = numeric.extract(nl["ppocr_text"])
@@ -719,6 +828,8 @@ def make_annotator(numbers: list[dict]):
             else:
                 pos[0] += 1
                 cls = ["num"]
+                if rec.get("verified") is False:
+                    cls.append("unverified")
                 if rec.get("needs_review"):
                     cls.append("review")
                 if rec.get("suspect_lost_separator"):
@@ -733,11 +844,29 @@ def make_annotator(numbers: list[dict]):
                     extra += " | flags: " + ",".join(rec["numeric_flags"])
                 if rec.get("dissent"):
                     extra += f" | {len(rec['dissent'])} dissenting reading(s)"
-                title = f"voted {numeric.format_key(rec['value'])} | {reads}{extra}"
+                voted = numeric.format_key(rec["value"])
+                if rec.get("verified") is False:
+                    title = (f"{voted} — single VL reading, NOT verified by any "
+                             f"vote{extra}")
+                    shown = q.raw
+                else:
+                    title = f"voted {voted} | {reads}{extra}"
+                    # Display the value the vote chose, not the reading it
+                    # rejected. Previously the page showed the VL model's digits
+                    # while the tooltip held the decision, so a vote that
+                    # correctly resolved 12.5 mg still printed "125" on screen --
+                    # a ten-fold dose, visible to a clinician who never hovers.
+                    shown = voted
                 mark = " ⚑" if rec.get("needs_review") else ""
+                body = html.escape(shown)
+                if rec.get("verified") is not False and shown != q.raw:
+                    # Keep the rejected reading visible, struck through, so the
+                    # correction is auditable on the page itself.
+                    body = (f'{html.escape(shown)} '
+                            f'<s class="rejected">{html.escape(q.raw)}</s>')
                 out.append(f'<span class="{" ".join(cls)}" '
                            f'title="{html.escape(title, quote=True)}">'
-                           f'{html.escape(q.raw)}{mark}</span>')
+                           f'{body}{mark}</span>')
             last = q.span[1]
         out.append(html.escape(text[last:]))
         return "".join(out)
@@ -765,6 +894,7 @@ td:first-child, th:first-child { text-align:left; }
 .num.suspect, .num.disputed { background:var(--bad-bg); color:var(--bad);
               border-bottom:2px solid var(--bad); font-weight:600; }
 .num.unverified { border-bottom:1px dashed var(--note); }
+.rejected { opacity:.65; font-size:.9em; }
 .page { border-top:3px solid var(--line); margin-top:2.5rem; padding-top:.5rem; }
 .gap { background:var(--bad-bg); color:var(--bad); border:2px dashed var(--bad);
        padding:.6rem .8rem; margin:.8rem 0; font-weight:600; }
@@ -912,6 +1042,11 @@ def main():
                     help="engine families required to corroborate a separator merge")
     ap.add_argument("--min-margin", type=float, default=0.15,
                     help="normalised vote margin below which a number needs review")
+    ap.add_argument("--per-engine-vote", dest="collapse_families",
+                    action="store_false", default=True,
+                    help="let every preprocessing variant cast its own ballot, as "
+                         "the vote did before family consensus. Kept so the two can "
+                         "be measured against each other")
     ap.add_argument("--dissent-floor", type=float, default=0.5,
                     help="a dissenting reading below this confidence is recorded in the "
                          "audit but does not by itself demand human review. Uncalibrated: "
