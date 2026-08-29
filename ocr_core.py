@@ -67,6 +67,22 @@ def doctags_to_markdown(doctags: str) -> tuple:
     Granite's output goes through exactly the same renderer, placeholder escaping
     and number annotation as DeepSeek's and Qwen's, so the modes stay comparable
     and there is one HTML path to get right instead of two.
+
+    Furniture is exported, and that is not a detail. DoclingDocument separates
+    body content from furniture -- page headers and footers -- and
+    export_to_markdown() omits furniture by default. On 20 pages of a real
+    medical bundle that silently deleted every page footer, all 20 of 20, while
+    word recall still read 92%. Those footers are where continuation pages carry
+
+      Patient: <name> | geb. <dob> | Dok-ID: <case>-<doc> Seite n von m
+
+    so pages whose identity appeared nowhere else lost the patient entirely and
+    the loss was invisible in every aggregate metric. Granite had read the footer
+    correctly; this function was throwing it away.
+
+    BODY and FURNITURE only. Exporting every layer would also pull in BACKGROUND
+    and INVISIBLE, which is where watermarks and hidden text live -- content that
+    is not on the page as printed and has no business in a clinical transcript.
     """
     if not doctags or not doctags.strip():
         return "", "empty DocTags"
@@ -76,10 +92,20 @@ def doctags_to_markdown(doctags: str) -> tuple:
     except Exception as exc:
         # Fail loudly rather than rendering raw DocTags as if it were prose.
         return "", f"docling-core unavailable ({exc}); DocTags cannot be parsed"
+    layers = None
+    try:
+        from docling_core.types.doc.document import ContentLayer
+        layers = {ContentLayer.BODY, ContentLayer.FURNITURE}
+    except Exception:
+        pass          # older docling-core: fall back to the default export
     try:
         dt = DocTagsDocument.from_doctags_and_image_pairs([doctags], [None])
         doc = DoclingDocument.load_from_doctags(dt, document_name="page")
-        return doc.export_to_markdown(), ""
+        md = (doc.export_to_markdown(included_content_layers=layers) if layers
+              else doc.export_to_markdown())
+        return md, ("" if layers else "furniture omitted: docling-core too old "
+                                      "to select content layers, so page headers "
+                                      "and footers are missing")
     except Exception as exc:
         return "", f"DocTags parse failed: {type(exc).__name__}: {exc}"
 

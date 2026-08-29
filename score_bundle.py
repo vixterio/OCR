@@ -180,19 +180,34 @@ def score(audit_path: str):
 
     # PII: search the pages a document actually occupies.
     text_by_page = {i + 1: norm(page_text(p)) for i, p in enumerate(pages)}
+    truth_by_page = {i + 1: norm(t) for i, t in enumerate(truth)}
     exp = pii_expectations(bundle, len(pages))
     fields = Counter(); found = Counter()
     misses = []
+    unreachable = Counter()
+
+    def present(cands, blob):
+        bare = re.sub(r"\s+", "", blob)
+        return any(norm(c) in blob or norm(re.sub(r"\s+", "", c)) in bare
+                   for c in cands)
+
     for doc in exp:
         blob = " ".join(text_by_page.get(p, "") for p in doc["pages"])
+        src = " ".join(truth_by_page.get(p, "") for p in doc["pages"])
         for field, cands in (("family", [doc["family"]]), ("given", [doc["given"]]),
                              ("dob", dob_variants(doc["dob"])),
                              ("kvnr", kvnr_variants(doc["kvnr"]))):
+            # Only ask for what is actually printed on the pages being scored.
+            # A document's manifest entry gives the patient's full identity, but
+            # the insurance number is typically printed once, on the document's
+            # first page. Demanding it from a continuation page counts a field
+            # that was never there as an OCR failure -- which made granite look
+            # like it lost 3 KVNRs when 2 of them are not in the source at all.
+            if not present(cands, src):
+                unreachable[field] += 1
+                continue
             fields[field] += 1
-            blob_bare = re.sub(r"\s+", "", blob)
-            ok = any(norm(c) in blob or norm(re.sub(r"\s+", "", c)) in blob_bare
-                     for c in cands)
-            if ok:
+            if present(cands, blob):
                 found[field] += 1
             else:
                 misses.append((doc["case"], doc["scenario"], field,
@@ -209,6 +224,7 @@ def score(audit_path: str):
         "n_recall": n_hit / max(1, n_exp), "n_precision": n_hit / max(1, n_found),
         "n_missed": n_exp - n_hit, "n_spurious": n_found - n_hit,
         "pii_fields": dict(fields), "pii_found": dict(found), "pii_misses": misses,
+        "pii_unreachable": dict(unreachable),
         "pii_rate": sum(found.values()) / max(1, sum(fields.values())),
         "footer_rate": foot_hit / max(1, foot_exp), "footer_exp": foot_exp,
         # >1 means the model emitted more text than the page holds. Repetition
@@ -265,9 +281,12 @@ def main():
     else:
         for r in rows:
             print(f"\n{r['mode']}  ({r['model']}, {r['pages']} pages of {r['bundle']})")
+            un = r["pii_unreachable"]
             print(f"  PII      {r['pii_rate']*100:.1f}%  " +
                   "  ".join(f"{k} {r['pii_found'].get(k,0)}/{v}"
-                            for k, v in sorted(r["pii_fields"].items())))
+                            for k, v in sorted(r["pii_fields"].items())) +
+                  (f"   [{sum(un.values())} field(s) not printed on these pages, "
+                   f"excluded: {un}]" if un else ""))
             print(f"  content  recall {r['w_recall']*100:.1f}%  precision {r['w_precision']*100:.1f}%"
                   f"  output/source length {r['length_ratio']:.2f}x")
             print(f"  footer   {r['footer_rate']*100:.0f}% of {r['footer_exp']} pages "
