@@ -31,7 +31,9 @@ if not runs:
 
 
 def peak_rss(mode: str) -> str:
-    wd = os.path.join(root, mode.replace("+", "_") + ".watchdog")
+    # run_matrix.sh writes "<label>.wd"; this looked for ".watchdog", so the
+    # peak-RSS column silently printed "?" for every row.
+    wd = os.path.join(root, mode.replace("+", "_") + ".wd")
     if not os.path.exists(wd):
         return "?"
     for line in reversed(open(wd, errors="ignore").read().splitlines()):

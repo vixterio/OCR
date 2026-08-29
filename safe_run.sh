@@ -101,6 +101,8 @@ echo "[watchdog] pid=$CHILD log=$LOG"
 
 REASON=""
 PEAK=0
+MIN_FREE=100
+MAX_SWAP=0
 FREE_LOW=0
 HARD_LOW=0
 while kill -0 "$CHILD" 2>/dev/null; do
@@ -125,6 +127,10 @@ while kill -0 "$CHILD" 2>/dev/null; do
   FP=$(free_pct); FP=${FP:-100}
   BATT=$(battery_pct); BATT=${BATT:-100}
   SL=$(speed_limit); SL=${SL:-100}
+  # Recorded here, after FP and SW_DELTA exist: these two track a crash, peak RSS
+  # does not, because MLX Metal buffers are not anonymous RSS.
+  [ "$FP" -lt "$MIN_FREE" ] && MIN_FREE=$FP
+  [ "$SW_DELTA" -gt "$MAX_SWAP" ] && MAX_SWAP=$SW_DELTA
 
   # Power and heat are the two ways this machine dies rather than merely slows.
   if ! on_ac && [ "$BATT" -lt "$ABORT_BATTERY_PCT" ]; then
@@ -182,5 +188,8 @@ HARD_LOW=0
 done
 
 wait "$CHILD"; RC=$?
-echo "[watchdog] child exited rc=$RC, peak RSS ${PEAK}MB. Log: $LOG"
+# Peak RSS understates the true footprint by the whole model size, because MLX
+# Metal buffers are not anonymous RSS. Minimum free memory and maximum swap
+# growth are the two signals that actually track a crash, so record them too.
+echo "[watchdog] child exited rc=$RC, peak RSS ${PEAK}MB, min free ${MIN_FREE}%, max swap +${MAX_SWAP}MB. Log: $LOG"
 exit $RC

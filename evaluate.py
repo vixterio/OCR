@@ -42,8 +42,12 @@ ENG = ["1,284.50", "2,019.75", "3,145.08", "6,449.33",
        "3,412.66", "1,073.82", "5,690.14", "10,176.62",
        "845.09", "2,764.53", "1,938.77", "5,548.39",
        "6,529.56", "7,414.50", "12,982.18", "26,926.24",
-       "18.7", "42.3",           # Growth: 18.7% YoY, margin 42.3%
-       "1", "2", "3"]            # Q1, Q2, Q3
+       "18.7", "42.3"]           # Growth: 18.7% YoY, margin 42.3%
+# NOT listed: the 1/2/3 in the "Q1 Q2 Q3" headers. numeric.extract deliberately
+# refuses a digit glued to a letter -- that guard is what stops "B12 450"
+# becoming 12450 -- so extract("Q1") == [] by design. Asking for them made three
+# permanently unreachable misses look like a pipeline failure. The euro page's
+# "Kwartał 1" headers ARE listed, because the space makes them reachable.
 
 TRUTH = {"test_record.pdf": [EURO, ENG],
          "euro_table_sample.png": [EURO],

@@ -43,6 +43,10 @@ import ocr_core
 import vl_registry as reg
 
 
+def transport_kind_for(spec, args) -> str:
+    return args.transport if args.transport != "auto" else spec.transport
+
+
 def server_models(url: str, timeout: int = 5) -> list[str]:
     try:
         with urllib.request.urlopen(f"{url}/models", timeout=timeout) as r:
@@ -128,9 +132,20 @@ def main():
     outdir = args.outdir or f"output/{args.mode.replace('+', '_')}"
     args.variants = prof.variants
     if args.vl_line_reads is None:
-        args.vl_line_reads = (spec.granularity == "block")
+        # MEASURED on the corrected fixture, all three families: per-line VL
+        # re-reads changed nothing -- identical recall, precision, missed and
+        # spurious -- while costing 4,264 to 22,370 extra tokens. For Granite
+        # they also inflated the review queue from 3 to 38 for no accuracy gain,
+        # which is worse than useless: it spends a reviewer's attention on
+        # numbers that were already right. Off everywhere until a degraded-input
+        # fixture shows a case where the third reading earns its cost.
+        args.vl_line_reads = False
     if args.sequential_lanes is None:
-        args.sequential_lanes = (spec.granularity == "page" and prof.ram_gb < 12)
+        # Only the worker transport can release the model between lanes: for the
+        # http models the mlx-vlm server holds it either way, so serialising them
+        # bought nothing and cost the whole VL page call in wall time.
+        args.sequential_lanes = (transport_kind_for(spec, args) == "worker"
+                                 and prof.ram_gb < 12)
 
     print(f"mode {args.mode}  |  {spec.family}  |  {spec.granularity}-granularity"
           f"{'  |  numeric vote ON' if verify else '  |  no verification'}")
