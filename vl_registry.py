@@ -176,15 +176,22 @@ MODES = {
     "granite+ocr":     ("granite", True),
 }
 
+# The VL model supplies layout and prose; the numeric vote is PP-OCR and
+# Tesseract. Described that way deliberately: with --vl-line-reads off, which is
+# the default, the VL model casts no per-number ballot, so calling these
+# three-engine votes overstated what the shipping configuration does.
+# --vl-line-reads adds it as a third voter for roughly ten times the tokens,
+# which on every fixture measured so far -- clean and heavily degraded -- bought
+# no accuracy at all.
 MODE_HELP = {
     "paddle": "PaddleOCR-VL alone (block-wise, OTSL tables)",
-    "paddle+ocr": "PaddleOCR-VL + PP-OCRv6 + Tesseract, numbers resolved by vote",
+    "paddle+ocr": "PaddleOCR-VL for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
     "deepseek": "DeepSeek-OCR-2 alone (page-wise, Markdown)",
-    "deepseek+ocr": "DeepSeek-OCR-2 + PP-OCRv6 + Tesseract, numbers resolved by vote",
+    "deepseek+ocr": "DeepSeek-OCR-2 for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
     "qwen": "Qwen3.5-VL alone (page-wise, Markdown)",
-    "qwen+ocr": "Qwen3.5-VL + PP-OCRv6 + Tesseract, numbers resolved by vote",
+    "qwen+ocr": "Qwen3.5-VL for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
     "granite": "Granite Docling 258M alone (page-wise, DocTags)",
-    "granite+ocr": "Granite Docling 258M + PP-OCRv6 + Tesseract, numbers by vote",
+    "granite+ocr": "Granite Docling for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
 }
 
 

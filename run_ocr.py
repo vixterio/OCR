@@ -316,6 +316,20 @@ def main():
     print(f"wall {audit['wall_seconds']}s")
     if not verify:
         print("NOTE: no verification in this mode; every number is a single reading.")
+    elif tot:
+        # Report which engine families actually voted, counted from the readings
+        # rather than claimed. With --vl-line-reads off -- the default -- the VL
+        # model reads the page but casts no per-number ballot, so the vote this
+        # repository calls three-engine is two engines, and nothing said so.
+        fams = sorted({hybrid_ocr.family(e)
+                       for pg in pages for n in pg.numbers
+                       for e in (n.get("readings") or {})})
+        print(f"vote: {len(fams)} engine famil{'y' if len(fams) == 1 else 'ies'} "
+              f"per number ({', '.join(fams) or 'none'})"
+              + ("" if args.vl_line_reads else
+                 "; the VL model read the page but did not vote on numbers "
+                 "(--vl-line-reads makes it vote, and costs ~10x the tokens "
+                 "for no measured accuracy gain)"))
     if gaps and not args.allow_gaps:
         print(f"\nexiting non-zero: {gaps} region(s) not transcribed "
               f"(--allow-gaps to override)")
