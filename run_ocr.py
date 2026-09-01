@@ -280,7 +280,7 @@ def main():
     title = os.path.basename(args.input)
     hybrid_ocr.write_atomic(os.path.join(outdir, "document.html"),
                             ocr_core.render_document(pages, title, spec, model,
-                                                     verify, args.mode))
+                                                     verify, args.mode, args.lang))
     audit = {
         "input": args.input, "mode": args.mode, "vl_model": model,
         "vl_family": spec.family, "granularity": spec.granularity,

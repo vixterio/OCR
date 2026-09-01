@@ -123,6 +123,43 @@ def _slot(slots: list, text: str) -> str:
     return f"\x00SLOT{len(slots) - 1}\x00"
 
 
+# OTSL cell-control tokens. Granite's DocTags can carry them through the docling
+# markdown export, and the page-granularity renderer has no OTSL converter -- the
+# one in hybrid_ocr.render_block only sees block-granularity output -- so they
+# reached the page as literal text. Measured on 20 pages: 83 of them, rendering a
+# lab value as "1.5<ecel>". They carry no digits, so removing them cannot disturb
+# the positional number queue that make_annotator depends on.
+_OTSL_TOKEN = re.compile(r"<\s*/?\s*(fcel|ecel|lcel|ucel|xcel|nl|ched|rhed|srow)\s*>",
+                         re.IGNORECASE)
+
+
+def strip_otsl(md: str) -> tuple[str, int]:
+    """Remove leaked OTSL control tokens, and say how many there were.
+
+    Deliberately reported rather than silently cleaned. A stray <ecel> is
+    evidence that a cell boundary was lost, and a table quietly tidied up is a
+    table whose geometry may be wrong with nothing left to show it. The count
+    travels into the page note so the loss stays visible.
+    """
+    cleaned, n = _OTSL_TOKEN.subn("", md)
+    return cleaned, n
+
+
+# Tesseract language codes are ISO 639-2; HTML wants 639-1. Only the languages
+# this pipeline is actually run with are mapped -- guessing at the rest would put
+# a wrong lang attribute on a clinical document, which is worse than none, since
+# screen readers and hyphenation both act on it.
+_ISO1 = {"deu": "de", "eng": "en", "fra": "fr", "spa": "es", "ita": "it",
+         "nld": "nl", "pol": "pl", "por": "pt", "ron": "ro", "ell": "el",
+         "rus": "ru", "ukr": "uk", "ces": "cs", "hun": "hu", "tur": "tr"}
+
+
+def html_lang(tess_lang: str) -> str:
+    """An HTML lang attribute for the declared OCR language, or none at all."""
+    code = _ISO1.get((tess_lang or "").split("+")[0].strip().lower())
+    return f' lang="{code}"' if code else ""
+
+
 def md_tables_to_html(md: str) -> str:
     """Render Markdown pipe tables, headings, lists and paragraphs to HTML.
 
@@ -555,12 +592,14 @@ def gap_html(b: Block) -> str:
             f'{html.escape(b.note or "see source image")}</div>')
 
 
-def render_page_html(page: PageResult, spec) -> tuple[str, tuple]:
+def render_page_html(page: PageResult, spec) -> tuple[str, tuple, int]:
     annotate, tally = make_annotator(page.numbers)
     parts = []
+    otsl = 0
     if spec.granularity == "page":
         if page.page_markdown:
-            markup, slots = md_tables_to_html(page.page_markdown)
+            md, otsl = strip_otsl(page.page_markdown)
+            markup, slots = md_tables_to_html(md)
             parts.append(fill_placeholders(markup, slots, annotate))
         for b in page.blocks:
             if b.status in ("image", "quarantined", "failed", "truncated", "empty"):
@@ -568,20 +607,29 @@ def render_page_html(page: PageResult, spec) -> tuple[str, tuple]:
     else:
         for b in page.blocks:
             parts.append(hybrid_ocr.render_block(b, annotate))
-    return "\n".join(parts), tally()
+    return "\n".join(parts), tally(), otsl
 
 
-def render_document(pages, title: str, spec, model: str, verify: bool, mode: str) -> str:
+def render_document(pages, title: str, spec, model: str, verify: bool, mode: str,
+                    lang: str = "") -> str:
     body, total, review, gaps = [], 0, 0, 0
     for pg in pages:
-        chunk, (used, avail) = render_page_html(pg, spec)
+        chunk, (used, avail), otsl = render_page_html(pg, spec)
         total += len(pg.numbers)
         review += sum(1 for n in pg.numbers if n.get("needs_review"))
         gaps += sum(1 for b in pg.blocks
                     if b.status in ("failed", "truncated", "quarantined"))
         note = ""
+        if otsl:
+            # Reported, not silently cleaned. A leaked cell-control token is
+            # evidence that a table boundary was lost, and a table quietly
+            # tidied up is one whose geometry may be wrong with nothing left
+            # to show it.
+            note += (f'<div class="banner">{otsl} table cell marker(s) leaked into '
+                     f'the text on this page and were removed. The table geometry '
+                     f'here may be wrong.</div>')
         if used != avail:
-            note = (f'<div class="banner">Provenance alignment incomplete: {used} of '
+            note += (f'<div class="banner">Provenance alignment incomplete: {used} of '
                     f'{avail} verified numbers matched the transcribed text. The rest '
                     f'are in the audit file.</div>')
         body.append(f'<section class="page" id="page-{pg.index + 1}">'
@@ -616,8 +664,9 @@ def render_document(pages, title: str, spec, model: str, verify: bool, mode: str
     banner = (f'<div class="banner">Unreviewed machine transcription — mode '
               f'<code>{html.escape(mode)}</code>. {review} number(s) flagged, '
               f'{gaps} region(s) not transcribed. Do not treat as a verified record.</div>')
+    LANG = html_lang(lang)
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html{LANG}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} — {html.escape(mode)}</title><style>{CSS}</style></head><body>
 <h1>{html.escape(title)}</h1>
