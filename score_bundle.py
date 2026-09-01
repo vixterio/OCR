@@ -172,11 +172,31 @@ def pii_expectations(bundle: str, n_pages: int):
     return out
 
 
+_SCAN_SUFFIX = re.compile(r"_scan_[a-z]+$")
+
+
+def origin_of(bundle: str) -> str:
+    """The born-digital bundle a scanned copy was made from.
+
+    scanify.py writes an image-only PDF, which is what makes it a fair scan
+    test -- and also means it carries no text layer to be scored against. Both
+    the ground truth and the manifest lookup therefore have to come from the
+    original. The degradation is a pure image transform of the same render, so
+    the words, numbers and patients on the page are unchanged by construction
+    and the original's answers remain the right ones.
+    """
+    stem, ext = os.path.splitext(bundle)
+    return _SCAN_SUFFIX.sub("", stem) + ext
+
+
 def score(audit_path: str):
     d = json.load(open(audit_path, encoding="utf-8"))
     src = (d.get("input") or "")
-    bundle = os.path.basename(src)
-    pdf = src if os.path.exists(src) else os.path.join(BUNDLE_DIR, bundle)
+    scanned = os.path.basename(src)
+    bundle = origin_of(scanned)
+    pdf = os.path.join(BUNDLE_DIR, bundle)
+    if not os.path.exists(pdf):
+        pdf = src if os.path.exists(src) else pdf
     if not os.path.exists(pdf):
         return None
     pages = d.get("pages", [])
@@ -249,7 +269,7 @@ def score(audit_path: str):
                for p in pages)
     npages = max(1, len(pages))
     return {
-        "path": audit_path, "bundle": bundle,
+        "path": audit_path, "bundle": bundle, "scanned": scanned != bundle,
         "mode": d.get("mode", "?"), "model": (d.get("vl_model") or "").split("/")[-1],
         "line_reads": d.get("vl_line_reads"), "pages": len(pages),
         "w_recall": w_hit / max(1, w_exp), "w_precision": w_hit / max(1, w_found),

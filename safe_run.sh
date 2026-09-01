@@ -85,6 +85,18 @@ else
 fi
 
 BASE_SWAP=$(swap_used_mb)
+# Refuse before launching rather than killing a child two seconds in. Swap that
+# is already above the ceiling is not this run's fault and this run cannot fix
+# it: macOS does not shrink swap files on request, so the honest answer is that
+# the machine needs to reclaim memory first. Starting anyway would burn a model
+# load to reach the same conclusion.
+if [ "$SWAP_ABS_MB" -gt 0 ] && [ "$BASE_SWAP" -gt "$SWAP_ABS_MB" ]; then
+  echo "[watchdog] REFUSING TO START: ${BASE_SWAP}MB already in swap, above the"
+  echo "[watchdog]   ${SWAP_ABS_MB}MB ceiling. Nothing this run does can bring that"
+  echo "[watchdog]   down. Close memory-heavy apps or restart, then try again."
+  echo "[watchdog]   Override with SWAP_ABS_MB=<higher> or SWAP_ABS_MB=0 to disable."
+  exit 98
+fi
 if [ "$POLL" -gt 5 ]; then
   echo "[watchdog] WARNING: POLL=${POLL}s is too slow to catch a memory collapse; 2s advised."
 fi
