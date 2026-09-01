@@ -21,3 +21,9 @@ merged_bundles/
 manifest.json
 bulk_upload_manifest.json
 scores/
+
+# Per-document extractions, OCR transcripts and HTML comparisons. All of it is
+# derived from patient-shaped records -- an extracted PDF is a page of one, and a
+# comparison report quotes both sides -- so none of it belongs in the repository.
+work/
+.DS_Store

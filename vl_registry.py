@@ -168,8 +168,16 @@ SPECS = {s.key: s for s in (PADDLE, DEEPSEEK, QWEN, GRANITE)}
 MODES = {
     "paddle":          ("paddle", False),
     "paddle+ocr":      ("paddle", True),
-    "deepseek":        ("deepseek", False),
-    "deepseek+ocr":    ("deepseek", True),
+    # WITHDRAWN on 8GB hardware -- uncomment both lines to reinstate.
+    # Measured on 20 pages of a real bundle: 25 worker restarts, pages 5 and 10
+    # lost outright, worst content recall of the four families at 85.8%, and the
+    # machine driven to 1% free memory. deepseek+ocr could not complete at all --
+    # it starved the machine until WindowServer was killed, and on retry managed
+    # 1 page of 20 in fifty minutes. The DEEPSEEK spec, its worker transport and
+    # the restart-and-retry fixes all remain in place and tested; only the menu
+    # entries are off, so reinstating on larger hardware needs nothing else.
+    # "deepseek":        ("deepseek", False),
+    # "deepseek+ocr":    ("deepseek", True),
     "qwen":            ("qwen", False),
     "qwen+ocr":        ("qwen", True),
     "granite":         ("granite", False),
@@ -186,12 +194,13 @@ MODES = {
 MODE_HELP = {
     "paddle": "PaddleOCR-VL alone (block-wise, OTSL tables)",
     "paddle+ocr": "PaddleOCR-VL for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
-    "deepseek": "DeepSeek-OCR-2 alone (page-wise, Markdown)",
-    "deepseek+ocr": "DeepSeek-OCR-2 for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
     "qwen": "Qwen3.5-VL alone (page-wise, Markdown)",
     "qwen+ocr": "Qwen3.5-VL for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
     "granite": "Granite Docling 258M alone (page-wise, DocTags)",
     "granite+ocr": "Granite Docling for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
+    # Withdrawn with the MODES entries above; uncomment together.
+    # "deepseek": "DeepSeek-OCR-2 alone (page-wise, Markdown)",
+    # "deepseek+ocr": "DeepSeek-OCR-2 for layout and prose; PP-OCRv6 + Tesseract vote on numbers",
 }
 
 

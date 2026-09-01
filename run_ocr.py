@@ -124,8 +124,12 @@ def main():
             print(f"  {'':14} model: {model}")
             print(f"  {'':14} {prof.describe()}")
         print("\ntiers per family:")
+        # Only families that are reachable as a mode. Listing a withdrawn one
+        # advertises a choice the menu no longer offers.
+        offered = {fam for fam, _ in reg.MODES.values()}
         for key, spec in reg.SPECS.items():
-            print(f"  {key:9} {spec.tier_table()}")
+            if key in offered:
+                print(f"  {key:9} {spec.tier_table()}")
         return
 
     if not args.input:
