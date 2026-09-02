@@ -160,6 +160,42 @@ def html_lang(tess_lang: str) -> str:
     return f' lang="{code}"' if code else ""
 
 
+# A degenerate tail is a run of identical lines carrying no content. Measured on
+# Qwen3.5-VL: page 1 of a real bundle ends its real transcript at line 54 and
+# then emits 1,000 copies of "| | | | | |"; page 6 ends at line 56 and emits
+# 1,223. Both consume the full 8,192-token ceiling, which is roughly 40% of that
+# mode's entire wall clock spent writing empty table rows -- and both were
+# recorded as "truncated", producing 36 phantom block gaps and the mode's two
+# lost page footers. Raising the token ceiling, the obvious reading of "it hit
+# max_tokens", would buy more junk.
+_MIN_DEGENERATE_RUN = 8
+
+
+def collapse_degenerate_tail(md: str, min_run: int = _MIN_DEGENERATE_RUN):
+    """Drop a trailing run of content-free lines. Returns (text, dropped).
+
+    The test is content, not identity. An earlier version required the repeated
+    line to be identical and found nothing on the very pages this was written
+    for: the 999 junk rows read "| | | | | |" but the final one read "| | | |",
+    so anchoring on the last line saw a run of one. Consuming backwards while a
+    line carries no letter and no digit handles the ragged end and is the safer
+    rule anyway -- a line with nothing in it cannot be data, however it is
+    punctuated.
+
+    A real table row always carries a letter or a digit, which is what keeps a
+    legitimately repetitive lab table (a column of identical 'normal' results)
+    out of this.
+    """
+    lines = md.split("\n")
+    i = len(lines)
+    while i > 0 and not any(c.isalnum() for c in lines[i - 1]):
+        i -= 1
+    dropped = len(lines) - i
+    if dropped < min_run:
+        return md, 0
+    return "\n".join(lines[:i]), dropped
+
+
 def md_tables_to_html(md: str) -> str:
     """Render Markdown pipe tables, headings, lists and paragraphs to HTML.
 
@@ -322,16 +358,45 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                         if b.status == "pending":
                             b.status, b.note = "failed", f"DocTags not rendered: {note}"
                     return
+            text, junk = collapse_degenerate_tail(text)
             page.page_markdown = text
             for b in blocks:
                 if b.status == "pending":
-                    b.status = "ok" if page.page_markdown else "empty"
-                    b.note = ("" if page.page_markdown
-                              else "VL returned no usable content for the page")
+                    if not page.page_markdown:
+                        b.status = "empty"
+                        b.note = "VL returned no usable content for the page"
+                    else:
+                        # 'assumed', not 'ok'. A page-granularity model returns
+                        # one transcript for the whole sheet, so nothing here
+                        # establishes that THIS block's content is in it. The
+                        # previous code wrote "ok" whenever the page produced any
+                        # text at all, and the consequence was measured: on 20
+                        # pages Granite and PaddleOCR-VL each reported 187 of 187
+                        # blocks ok with zero gaps, while Granite page 10 ended
+                        # its transcript mid-document and dropped a header, three
+                        # footer blocks and the page number -- the one page where
+                        # it lost the patient identity. A pipeline that reports
+                        # complete success while silently discarding a region is
+                        # worse than one that fails loudly.
+                        b.status = "assumed"
+                        b.note = ("covered by the page transcript; not "
+                                  "individually verified")
             if reply.truncated:
+                # Say WHICH truncation this was. A reply that hit the ceiling
+                # while emitting content is a page too long for the budget; one
+                # that hit it while repeating an empty table row is a decode
+                # loop, and the two want opposite responses -- raising the
+                # ceiling helps the first and buys more junk for the second.
+                why = ("VL page reply hit max_tokens while repeating an empty "
+                       f"line {junk} times: a decode loop, not a page too long. "
+                       "Raising max_tokens would produce more of the same."
+                       if junk else "VL page reply hit max_tokens")
                 for b in blocks:
-                    if b.status == "ok":
-                        b.status, b.note = "truncated", "VL page reply hit max_tokens"
+                    if b.status in ("ok", "assumed"):
+                        b.status, b.note = "truncated", why
+            elif junk:
+                page.notes.append(f"{junk} content-free line(s) removed from the "
+                                  f"end of the transcript")
         except VLLocalError as exc:
             # Ordered before VLError, which it subclasses. Labelling a local
             # out-of-memory as a contract violation blames the model for the
@@ -661,9 +726,18 @@ def render_document(pages, title: str, spec, model: str, verify: bool, mode: str
                     f"All <strong>{total}</strong> numbers below are single readings "
                     f"from one model with no cross-check, and are shown dashed for "
                     f"that reason. Run a <code>+ocr</code> mode to have them voted on.")
+    assumed = sum(1 for p in pages for b in p.blocks if b.status == "assumed")
+    # Stated plainly rather than folded into "ok". A page-granularity model
+    # returns one transcript for the sheet, so no individual region was checked
+    # against it, and a reader deserves to know that the completeness claim is
+    # weaker than it looks.
+    assumed_note = (f' {assumed} region(s) are assumed covered by the page '
+                    f'transcript but were not individually verified.'
+                    if assumed else '')
     banner = (f'<div class="banner">Unreviewed machine transcription — mode '
               f'<code>{html.escape(mode)}</code>. {review} number(s) flagged, '
-              f'{gaps} region(s) not transcribed. Do not treat as a verified record.</div>')
+              f'{gaps} region(s) not transcribed.{assumed_note} '
+              f'Do not treat as a verified record.</div>')
     LANG = html_lang(lang)
     return f"""<!doctype html>
 <html{LANG}><head><meta charset="utf-8">

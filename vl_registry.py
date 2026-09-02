@@ -240,6 +240,15 @@ class Profile:
     cpu_workers: int
     rss_limit_mb: int
     vl_max_pixels: int
+    # Thresholding variants are OFF by default at every tier, and that is a
+    # measured decision rather than a memory one. On a heavily degraded page
+    # otsu3x read 55% of the numbers and adaptive3x 64%, against 100% for raw and
+    # up3x -- and the reason is not stroke erosion but precision collapse:
+    # stroke recall stays above 99% while connected components go from 215 to
+    # 1799 and 8808, so the threshold promotes speckle into ink. On clean input
+    # all four variants produce identical readings, so they were pure cost there
+    # too. imageprep.py now handles degraded input photometrically, in grayscale.
+    # --variants restores them for anyone who wants to re-measure.
     variants: tuple
 
     @classmethod
@@ -250,16 +259,16 @@ class Profile:
         # from 2-6 workers), so extra GPU workers buy cross-lane overlap only.
         if ram_gb < 12:
             gpu, cpu, rss = 2, 1, 3800
-            variants = ("raw", "up3x", "otsu3x")
+            variants = ("raw", "up3x")
         elif ram_gb < 24:
             gpu, cpu, rss = 3, 2, 9000
-            variants = ("raw", "up3x", "otsu3x", "adaptive3x")
+            variants = ("raw", "up3x")
         elif ram_gb < 48:
             gpu, cpu, rss = 4, 4, 20000
-            variants = ("raw", "up3x", "otsu3x", "adaptive3x")
+            variants = ("raw", "up3x")
         else:
             gpu, cpu, rss = 6, 8, 48000
-            variants = ("raw", "up3x", "otsu3x", "adaptive3x")
+            variants = ("raw", "up3x")
         px = spec.max_pixels if spec else 1024 * 28 * 28
         if ram_gb >= 24:
             px = int(px * 1.5)      # more headroom for the encoder

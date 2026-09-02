@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 
 import hybrid_ocr
+import imageprep
 import ocr_core
 import vl_registry as reg
 
@@ -81,6 +82,21 @@ def main():
     ap.add_argument("--w-tesseract", type=float, default=1.0)
     ap.add_argument("--min-families", type=int, default=2)
     ap.add_argument("--min-margin", type=float, default=0.15)
+    ap.add_argument("--variants", nargs="+", default=None,
+                    choices=["raw", "up3x", "otsu3x", "adaptive3x"],
+                    help="preprocessing variants the CPU engines read. Default is "
+                         "raw and up3x; the thresholding variants are off because "
+                         "they measured 55%% and 64%% recall on a degraded page "
+                         "against 100%% for these two")
+    ap.add_argument("--no-imageprep", action="store_true",
+                    help="skip the page probe and every correction it would gate. "
+                         "The probe costs 79-96ms on an A4 page at 300 dpi and "
+                         "only applies what it can justify, so this is for "
+                         "isolating its effect rather than for saving time")
+    ap.add_argument("--no-deskew", action="store_true",
+                    help="measure skew and report it, but never rotate. Rotation "
+                         "resamples every pixel, so this is the switch to reach "
+                         "for if a corrected page ever looks worse than the original")
     ap.add_argument("--per-engine-vote", dest="collapse_families",
                     action="store_false", default=True,
                     help="let every preprocessing variant cast its own ballot, as "
@@ -139,7 +155,7 @@ def main():
     gpu_workers = args.gpu_workers or prof.gpu_workers
     max_pixels = args.vl_max_pixels or prof.vl_max_pixels
     outdir = args.outdir or f"output/{args.mode.replace('+', '_')}"
-    args.variants = prof.variants
+    args.variants = tuple(args.variants) if args.variants else prof.variants
     if args.vl_line_reads is None:
         # MEASURED on the corrected fixture, all three families: per-line VL
         # re-reads changed nothing -- identical recall, precision, missed and
@@ -259,6 +275,18 @@ def main():
     pages = []
     try:
         for idx, img, dpi, source, chars in hybrid_ocr.iter_input_pages(args.input, args):
+            # Correct the page before anything looks at it, so the layout
+            # detector, the VL model and the OCR engines all see the same
+            # pixels and the block boxes are in one coordinate system. Only
+            # corrections the probe justified actually run; on a clean
+            # born-digital page that is the content crop and nothing else.
+            prep_info = {}
+            if not args.no_imageprep:
+                fixed, probe, plan, applied = imageprep.prepare(
+                    img, allow_geometry=not args.no_deskew)
+                prep_info = {"probe": probe.as_dict(), "plan": plan.as_dict(),
+                             "applied": applied}
+                img = fixed
             pg = ocr_core.process_page(img, idx, eng, pool, spec, model, verify,
                                        args, priors, vl_fn=vl_fn, layout=layout,
                                        eng_factory=eng_factory if verify else None,
@@ -267,6 +295,7 @@ def main():
                                                      and not args.vl_line_reads)
                                                  else None))
             pg.dpi, pg.source = dpi, source
+            pg.prep = prep_info
             pages.append(pg)
             flagged = sum(1 for n in pg.numbers if n.get("needs_review"))
             print(f"  page {idx + 1}: {len(pg.blocks)} blocks, {len(pg.numbers)} numbers, "
@@ -300,6 +329,10 @@ def main():
             "vl_prompt_tokens": p.vl_prompt_tokens,
             "vl_completion_tokens": p.vl_completion_tokens,
             "page_markdown": p.page_markdown,
+            # What the probe measured and what it decided, per page, so a run
+            # can be re-read later to ask whether a correction earned its cost.
+            "imageprep": p.prep,
+            "notes": p.notes,
             # Block text is kept so block-granularity modes can be scored at all.
             # PaddleOCR-VL returns per-block text and leaves page_markdown empty,
             # so an audit without this has nothing to compare against the source
@@ -320,7 +353,9 @@ def main():
     ct = sum(p.vl_completion_tokens for p in pages)
     calls = sum(p.vl_calls for p in pages)
     print(f"\nwrote {outdir}/document.html and audit.json")
-    print(f"pages {len(pages)} | numbers {tot} | need review {review} | gaps {gaps}")
+    assumed = sum(1 for p in pages for b in p.blocks if b.status == "assumed")
+    print(f"pages {len(pages)} | numbers {tot} | need review {review} | gaps {gaps}"
+          + (f" | {assumed} region(s) assumed covered, not verified" if assumed else ""))
     print(f"VL: {calls} calls, {pt} prompt + {ct} completion = {pt + ct} tokens")
     print(f"wall {audit['wall_seconds']}s")
     if not verify:

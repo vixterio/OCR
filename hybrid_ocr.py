@@ -514,7 +514,12 @@ def vote(per_source: dict[str, tuple[str, float]], priors: dict[str, float],
         "weight": round(best_w, 4),
         "margin": round(best_w - runner_w, 4),
         "margin_frac": round((best_w - runner_w) / total, 4),
-        "unanimous": len(all_values) == 1,
+        # Unanimity requires someone to agree WITH. One engine reading a value
+        # unopposed is not a consensus, and reporting it as unanimous is how an
+        # audit ends up asserting "unanimous, margin 1.00" about precisely the
+        # numbers that are wrong -- which is the fastest way to teach a reviewer
+        # to stop reading the confidence column.
+        "unanimous": len(all_values) == 1 and len(families) >= 2,
         "n_families": len(families),
         "candidates": {v: round(w, 4) for v, w in ranked},
         # Per-family agreement, so a damped vote can be seen rather than inferred
@@ -534,7 +539,10 @@ class Block:
     index: int
     label: str
     box: tuple[int, int, int, int]
-    status: str = "pending"     # ok | quarantined | image | failed | truncated | empty
+    status: str = "pending"     # ok | assumed | quarantined | image | failed |
+                                # truncated | empty. "assumed" means a
+                                # page-granularity transcript is believed to
+                                # cover this block but nothing verified it.
     text: str = ""
     confidence: float = 0.0
     note: str = ""
@@ -553,6 +561,10 @@ class PageResult:
     vl_completion_tokens: int = 0
     vl_calls: int = 0
     page_markdown: str = ""      # set by page-granularity VL models
+    # Page-level diagnostics that are not a block failure: a collapsed decode
+    # loop, leaked table markers, an imageprep correction that fired.
+    notes: list[str] = field(default_factory=list)
+    prep: dict = field(default_factory=dict)
 
     @property
     def incomplete(self) -> list[Block]:

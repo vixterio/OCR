@@ -76,6 +76,16 @@ bs, ags = family_ballots(split)
 check("a split family still casts one ballot", round(sum(bs["ppocr"].values()), 6), 0.8)
 check("...divided by internal support", round(ags["ppocr"], 3), 0.5)
 
+print("\nunanimity needs someone to agree with")
+solo = {"ppocr": (R, .9)}
+pair = {"ppocr": (R, .9), "tesseract": (R, .85)}
+check("one family alone is not unanimous",
+      vote(solo, PRIORS, {R}, True)["unanimous"], False)
+check("two agreeing families are", vote(pair, PRIORS, {R}, True)["unanimous"], True)
+check("variants of one family are still one family",
+      vote({"ppocr": (R, .9), "ppocr:up3x": (R, .9)}, PRIORS, {R}, True)["unanimous"],
+      False)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
