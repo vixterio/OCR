@@ -71,7 +71,15 @@ def truth_for(src: str):
 
 
 def canon(raw: str):
-    """A value's canonical decimal, so 1.284,50 and 1,284.50 compare equal."""
+    """A value's canonical decimal, so 1.284,50 and 1,284.50 compare equal.
+
+    A leading comparator is stripped first. The bound is part of the voting key
+    -- "< 200" must not corroborate a bare "200" -- but a score asking whether
+    the number was recovered wants 200 either way, and without this every
+    comparator-prefixed value normalised to None and disappeared from the
+    expected and found sets alike.
+    """
+    _, raw = numeric.split_bound(raw)
     v, _ = numeric.normalise(raw)
     if v is None:
         return None

@@ -81,6 +81,9 @@ def numbers_in(text: str) -> Counter:
     for k in numeric.keys(_MD.sub(" ", text)):
         body = k.split(":")[1] if ":" in k else k
         for part in body.split("/"):
+            # Strip the comparator: it distinguishes readings for the vote but
+            # must not hide the number from the score.
+            _, part = numeric.split_bound(part)
             v, _ = numeric.normalise(part)
             if v is not None:
                 out[v] += 1
@@ -102,6 +105,9 @@ def resolved_numbers(page: dict) -> Counter:
         key = rec.get("value") or ""
         body = key.split(":")[1] if key.count(":") >= 1 else key
         for part in body.split("/"):
+            # Strip the comparator: it distinguishes readings for the vote but
+            # must not hide the number from the score.
+            _, part = numeric.split_bound(part)
             v, _ = numeric.normalise(part)
             if v is not None:
                 out[v] += 1

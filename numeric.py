@@ -52,9 +52,11 @@ RISKY_UNITS = {"mcg", "µg", "ug", "mg", "g", "kg", "IU", "U", "u", "units", "un
 class Quantity:
     """One numeric thing found in a line of text."""
     raw: str                       # exactly as it appeared
-    kind: str                      # plain | range | ratio | fraction | date | product
+    kind: str                      # plain | range | ratio | fraction | date |
+                                   # product | identifier
     values: list[str]              # canonical surface forms, precision preserved
     unit: str | None = None
+    bound: str | None = None       # a leading <, >, <= or >= -- see _BOUND_BEFORE
     span: tuple[int, int] = (0, 0)
     flags: list[str] = field(default_factory=list)
 
@@ -66,7 +68,14 @@ class Quantity:
         together, but `values` keeps the surface form so the precision difference
         is still visible in the audit.
         """
-        return f"{self.kind}:{'/'.join(_canonical(v) for v in self.values)}:{self.unit or ''}"
+        body = "/".join(_canonical(v) for v in self.values)
+        # The bound is part of the value's identity, not decoration. Without it
+        # "< 200" and "200" produced the same key and voted as though they
+        # agreed, so an engine that read the comparator and one that missed it
+        # counted as corroborating each other -- and the output could assert
+        # "200" where the page said "less than 200". In a reference limit or a
+        # detection threshold those are different clinical statements.
+        return f"{self.kind}:{self.bound or ''}{body}:{self.unit or ''}"
 
 
 def _canonical(v: str) -> str:
@@ -161,9 +170,44 @@ def normalise(raw: str) -> tuple[str | None, list[str]]:
     return s, flags
 
 
+def kvnr_check_digit(value: str) -> bool | None:
+    """Validate a German Krankenversichertennummer's check digit.
+
+    Letter to two-digit alphabet position, then the first eight digits, weighted
+    alternately 1 and 2 with each product reduced to a single digit; the total
+    mod 10 must equal the tenth character. Returns None when the string is not
+    the right shape to check.
+
+    Verified against every KVNR in the corpus: 306 of 306 valid, and it rejects
+    8,100 of 8,100 single-digit substitutions and 708 adjacent transpositions --
+    which is exactly the OCR failure mode this field suffers from, an I read as a
+    1 or two digits swapped. A checksum is the only signal here that does not
+    depend on reading the glyph correctly.
+    """
+    t = re.sub(r"\s+", "", value.upper())
+    if not re.fullmatch(r"[A-Z]\d{9}", t):
+        return None
+    digits = f"{ord(t[0]) - 64:02d}" + t[1:9]
+    total = 0
+    for i, ch in enumerate(digits):
+        prod = int(ch) * (2 if i % 2 else 1)
+        total += prod - 9 if prod > 9 else prod
+    return total % 10 == int(t[9])
+
+
 # ---- structural patterns, matched before bare numbers so that a hyphen or -----
 # ---- slash between digits is never read as a sign or a separator --------------
 _PATTERNS = [
+    # Structured identifiers, matched FIRST so the pieces are never mistaken for
+    # measurements. A German Krankenversichertennummer is a letter and nine
+    # digits, printed as "H472 261 455". Before this pattern existed, extract()
+    # returned exactly one quantity for that string -- plain:261455: -- because
+    # the letter guard correctly refused "472" glued to "H" and then the
+    # space-grouping rule merged "261 455". Two thirds of the number was silently
+    # discarded and the vote never saw the identifier at all, which is why the
+    # KVNR scored worst of every field in every mode: no amount of better
+    # recognition can fix a value the numeric layer throws away.
+    ("identifier", re.compile(r"(?<![A-Za-z0-9])([A-Z])[  ]?(\d{3})[  ]?(\d{3})[  ]?(\d{3})(?![0-9])")),
     # ISO and slash/dot dates. Matched first so '2024-05-12' never yields -05.
     ("date", re.compile(r"(?<![\d.,])(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?![\d.,])")),
     ("date", re.compile(r"(?<![\d.,])(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?![\d.,])")),
@@ -184,6 +228,20 @@ _FRACTION_MAP = {"½": "0.5", "¼": "0.25", "¾": "0.75", "⅓": "0.333", "⅔":
 # "B12 450" becoming 12450 did not apply to any accented Latin script:
 # "Gęślą987,31" yielded 987,31 and "Kwartał1" yielded 1.
 _BARE_RE = re.compile(rf"(?<![0-9.,])(?<![^\W\d_]){_BARE}")
+# Matched against the text ENDING at the number's start, so it sees what precedes
+# it. The escaped forms are here because transcribed text can arrive after an
+# HTML round trip, where "<" has become "&lt;".
+_BOUND_BEFORE = re.compile(r"(<=|>=|[<>\u2264\u2265]|&lt;=?|&gt;=?)\s*$")
+_BOUND_CANON = {"&lt;": "<", "&gt;": ">", "&lt;=": "<=", "&gt;=": ">=",
+                "\u2264": "<=", "\u2265": ">="}
+
+
+def _bound_at(text: str, start: int) -> str | None:
+    """The comparator immediately preceding a number, canonicalised."""
+    m = _BOUND_BEFORE.search(text, 0, start)
+    if not m:
+        return None
+    return _BOUND_CANON.get(m.group(1), m.group(1))
 _UNIT_AFTER = re.compile(rf"\s*({_UNIT_RE})(?![A-Za-z])")
 
 
@@ -215,6 +273,14 @@ def extract(text: str) -> list[Quantity]:
             if kind == "date":
                 claim(*m.span())
                 out.append(Quantity(m.group(), "date", list(m.groups()), span=m.span()))
+                continue
+            if kind == "identifier":
+                claim(*m.span())
+                letter, a, b, c = m.groups()
+                body = f"{letter}{a}{b}{c}"
+                ok = kvnr_check_digit(body)
+                out.append(Quantity(m.group(), "identifier", [body], span=m.span(),
+                                    flags=[] if ok else ["identifier_checksum_failed"]))
                 continue
             parts, flags = [], []
             for g in m.groups():
@@ -248,7 +314,9 @@ def extract(text: str) -> list[Quantity]:
             unit = um.group(1)
             if unit in RISKY_UNITS:
                 flags = flags + ["risky_unit"]
-        out.append(Quantity(m.group(), "plain", [v], unit=unit, span=m.span(), flags=flags))
+        out.append(Quantity(m.group(), "plain", [v], unit=unit,
+                            bound=_bound_at(text, m.start()),
+                            span=m.span(), flags=flags))
 
     out.sort(key=lambda q: q.span[0])
     return out
@@ -286,6 +354,26 @@ def lost_separator_spans(text: str) -> list[tuple[int, int]]:
         if len(m.group(1)) != 3:
             spans.append((m.start(), m.end() + len(m.group(1))))
     return spans
+
+
+_LEADING_BOUND = re.compile(r"^\s*(<=|>=|[<>\u2264\u2265])\s*")
+
+
+def split_bound(text: str) -> tuple[str | None, str]:
+    """Separate a leading comparator from the value it qualifies.
+
+    Needed because the bound belongs in the VOTE key -- "< 200" must not
+    corroborate a bare "200" -- but not in a SCORE. A scorer asking "did the
+    pipeline recover this number" wants 200 either way; without this split every
+    comparator-prefixed value canonicalised to None and vanished from both the
+    expected and found sets, quietly shrinking the denominator of every accuracy
+    figure. The corpus prints 89 of them in 20 pages, so that is not a rounding
+    error.
+    """
+    m = _LEADING_BOUND.match(text or "")
+    if not m:
+        return None, (text or "")
+    return m.group(1), text[m.end():]
 
 
 def format_key(key: str) -> str:

@@ -132,6 +132,48 @@ check("'café12' yields nothing", vals("café12"), [])
 check("'B12 450' still yields 450", vals("B12 450"), ["450"])
 check("'HbA1c 6.5' still yields 6.5", vals("HbA1c 6.5"), ["6.5"])
 
+# ---- structured identifiers -------------------------------------------------
+# A KVNR used to be destroyed by the numeric layer: extract() returned exactly
+# one quantity for "H472 261 455", plain:261455:, because the letter guard
+# refused "472" glued to "H" and the space-grouping rule then merged "261 455".
+# Two thirds of the identifier was discarded before the vote ever saw it.
+from numeric import kvnr_check_digit
+check("KVNR is one quantity, not a fragment",
+      [q.kind for q in extract("Versicherungs-Nr.: H472 261 455")], ["identifier"])
+check("KVNR keeps its letter", keys("H472 261 455"), ["identifier:H472261455:"])
+check("KVNR spans are not split", len(extract("KVNR I947 140 439")), 1)
+check("valid check digit accepted", kvnr_check_digit("H472 261 455"), True)
+check("valid check digit, no spaces", kvnr_check_digit("H177763173"), True)
+check("altered digit rejected", kvnr_check_digit("H472 261 456"), False)
+check("I read as 1 rejected", kvnr_check_digit("1947 140 439"), None)
+check("wrong shape is not judged", kvnr_check_digit("H12 34"), None)
+check("failed checksum is flagged",
+      extract("A457 947 787")[0].flags, ["identifier_checksum_failed"])
+check("valid checksum is not flagged", extract("A457 947 786")[0].flags, [])
+# The identifier pattern must not swallow ordinary measurements.
+check("'B12 450 mg' unaffected", vals("B12 450 mg"), ["450"])
+check("three plain groups are not an identifier",
+      [q.kind for q in extract("450 261 455")], ["plain"])
+
+# ---- comparators ------------------------------------------------------------
+# "< 200" and "200" used to produce the same key, so an engine that read the
+# comparator and one that missed it counted as agreeing, and the vote could
+# assert "200" where the page said "less than 200".
+from numeric import split_bound
+check("'<' is kept in the key", keys("Ferritin < 200 ug/l"), ["plain:<200:ug"])
+check("no-space form too", keys("CRP <5 mg/l"), ["plain:<5:mg"])
+check("'>' is kept", keys("GFR > 60"), ["plain:>60:"])
+check("'<=' is kept", keys("x <= 3"), ["plain:<=3:"])
+check("unicode '>=' normalises", keys("y \u2265 12"), ["plain:>=12:"])
+check("html-escaped '<' is kept", keys("D-Dimer &lt;0.5"), ["plain:<0.5:"])
+check("a bare value keeps no bound", keys("Wert 200 ug/l"), ["plain:200:ug"])
+check("bounded and bare no longer agree",
+      keys("< 200")[0] != keys("200")[0], True)
+check("a minus sign is not a comparator", keys("pH 7.4"), ["plain:7.4:"])
+# The bound must not hide the number from a scorer.
+check("split_bound separates", split_bound("<200"), ("<", "200"))
+check("split_bound passes plain through", split_bound("200"), (None, "200"))
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
