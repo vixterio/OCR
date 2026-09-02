@@ -196,6 +196,57 @@ def collapse_degenerate_tail(md: str, min_run: int = _MIN_DEGENERATE_RUN):
     return "\n".join(lines[:i]), dropped
 
 
+# Measured across all 313 documents in the generator's corpus: the longest run of
+# identical consecutive lines in any real document is 4 ("b.B.", "Bedarf", "2 ml"
+# in medication tables). Granite emitted the word "Referenzbereich" 303 times on
+# one lab page, burning 7,647 completion tokens -- about 75% of that document's
+# entire budget -- on a single repeated word. A limit of 12 sits three times
+# above anything legitimate and well below anything degenerate.
+_MAX_IDENTICAL_RUN = 12
+
+
+def collapse_repeated_runs(md: str, limit: int = _MAX_IDENTICAL_RUN):
+    """Cap runs of identical consecutive lines. Returns (text, dropped).
+
+    A different loop from collapse_degenerate_tail, which only handles a tail of
+    content-free lines. This one catches a model stuck repeating a real word, in
+    the middle of a page, where the content-free test correctly refuses to act.
+
+    The first `limit` copies are kept rather than one. A run that was genuinely
+    long stays visibly long, the reader can still see what happened, and the
+    numeric queue is disturbed as little as the removal allows -- these lines
+    carry no digits in the observed case, but the guard is not that they cannot.
+    """
+    lines = md.split("\n")
+    out, dropped, run, prev = [], 0, 0, None
+    pending = []
+    for line in lines:
+        key = line.strip()
+        if not key:
+            # Blank lines are transparent to the run. Markdown separates
+            # paragraphs with them, so the observed loop reads
+            # "Referenzbereich\n\nReferenzbereich\n\n..." -- resetting the run
+            # on a blank made a 303-long repetition look like 303 runs of one,
+            # and the first version of this function removed nothing at all from
+            # the very page it was written for.
+            pending.append(line)
+            continue
+        if key == prev:
+            run += 1
+            if run >= limit:
+                dropped += 1
+                pending = []
+                continue
+        else:
+            run = 0
+        prev = key
+        out.extend(pending)
+        pending = []
+        out.append(line)
+    out.extend(pending)
+    return ("\n".join(out), dropped) if dropped else (md, 0)
+
+
 def md_tables_to_html(md: str) -> str:
     """Render Markdown pipe tables, headings, lists and paragraphs to HTML.
 
@@ -359,6 +410,12 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                             b.status, b.note = "failed", f"DocTags not rendered: {note}"
                     return
             text, junk = collapse_degenerate_tail(text)
+            text, looped = collapse_repeated_runs(text)
+            if looped:
+                page.notes.append(
+                    f"{looped} line(s) removed from a run of identical repeated "
+                    f"lines: the model looped. No real document in the reference "
+                    f"corpus repeats a line more than 4 times.")
             page.page_markdown = text
             for b in blocks:
                 if b.status == "pending":
