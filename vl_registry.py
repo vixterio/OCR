@@ -167,7 +167,16 @@ GRANITE = VLSpec(
     },
     page_prompt="Convert this page to docling.",
     line_prompt="Convert this page to docling.",
-    max_tokens_page=8192,
+    # 2560, not 8192. Granite's largest legitimate page across 46 measured pages
+    # needed 1,659 completion tokens (median 973, p90 1,280); the single outlier
+    # spent 7,647 on a decode loop. This keeps ~1.5x headroom over anything real
+    # and bounds the loop, which is the only lever that works here --
+    # repetition_penalty was swept at 1.05, 1.1 and 1.2 on the looping page and
+    # every value produced ~7,650 tokens with the same repetition, because the
+    # model re-emits a POSITIONED element rather than drifting into a token rut.
+    # No penalty is set for this family for that reason; dedupe_doctags, which
+    # drops elements repeating a coordinate box, is what actually catches it.
+    max_tokens_page=2560,
     max_tokens_line=256,
     max_pixels=1024 * 28 * 28,
     notes=("Purpose-built for document conversion and trained to emit DocTags, a "

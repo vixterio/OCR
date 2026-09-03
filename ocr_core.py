@@ -55,6 +55,43 @@ def block_prompt(spec, label: str) -> str:
     return bp.get("default", spec.line_prompt or "OCR:")
 
 
+_DT_ELEMENT = re.compile(
+    r"<(?P<tag>[a-z_0-9]+)>(?P<loc>(?:<loc_\d+>){4})(?P<body>.*?)</(?P=tag)>", re.S)
+
+
+def dedupe_doctags(doctags: str) -> tuple:
+    """Drop elements repeating a coordinate box already used. Returns (text, dropped).
+
+    Two elements cannot occupy the same box on a page, so a repeated coordinate
+    tuple is not ambiguous evidence of a loop -- it is the loop. Measured on one
+    Granite page: 316 coordinate boxes of which 57 were distinct, the worst
+    repeated 33 times, every copy the word "Referenzbereich" at
+    <loc_255><loc_524><loc_315><loc_531>.
+
+    This is also why a repetition penalty does nothing for Granite. Swept at
+    1.05, 1.1 and 1.2 on that page, every value produced ~7,650 tokens and the
+    same repetition: the model is re-emitting a positioned element, not drifting
+    into a token rut, so penalising token history leaves it untouched.
+    Deduplicating by position matches the actual failure.
+
+    docling already collapses these downstream -- it retained 26.4% of that
+    reply, close to the distinct fraction -- so this does not change what the
+    transcript says. It makes the loop countable instead of silently absorbed.
+    """
+    seen, out, dropped, last = set(), [], 0, 0
+    for m in _DT_ELEMENT.finditer(doctags):
+        loc = m.group("loc")
+        if loc in seen:
+            out.append(doctags[last:m.start()])
+            dropped += 1
+        else:
+            seen.add(loc)
+            out.append(doctags[last:m.end()])
+        last = m.end()
+    out.append(doctags[last:])
+    return "".join(out), dropped
+
+
 def doctags_to_markdown(doctags: str) -> tuple:
     """Convert Granite Docling's DocTags to Markdown. Returns (markdown, note).
 
@@ -403,8 +440,24 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
             reply = page_future.result(timeout=args.block_timeout)
             account(reply)
             text = reply.text
+            raw_len = len(text)
+            dt_dropped = 0
             if spec.output == "doctags":
+                # Everything after the first </doctag> is malformed: the observed
+                # reply closed the document four times, each followed by a stray
+                # </text>. Cut at the first close rather than hand the parser a
+                # document that ends three times over.
+                close = text.find("</doctag>")
+                if close != -1:
+                    text = text[:close + len("</doctag>")]
+                text, dt_dropped = dedupe_doctags(text)
+                if dt_dropped:
+                    page.notes.append(
+                        f"{dt_dropped} DocTags element(s) repeated a coordinate "
+                        f"box already used and were dropped: the model looped on "
+                        f"a positioned element.")
                 text, note = doctags_to_markdown(text)
+                page.doctags_retained = (len(text) / raw_len) if raw_len else None
                 if note and not text:
                     for b in blocks:
                         if b.status == "pending":
@@ -417,6 +470,19 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
                     f"{looped} line(s) removed from a run of identical repeated "
                     f"lines: the model looped. No real document in the reference "
                     f"corpus repeats a line more than 4 times.")
+            # chars/token is measured on the RAW reply, never the converted
+            # text: using the converted length would blame the model for
+            # whatever the converter discarded. The two failure modes want
+            # opposite fixes -- a looping model needs its decoding constrained,
+            # a lossy converter needs fixing, and no penalty touches the second.
+            page.chars_per_token = (raw_len / reply.completion_tokens
+                                    if reply.completion_tokens else None)
+            if (reply.completion_tokens > 400 and page.chars_per_token is not None
+                    and page.chars_per_token < 0.6):
+                page.notes.append(
+                    f"possible decode loop: {reply.completion_tokens} completion "
+                    f"tokens produced only {raw_len} characters of reply "
+                    f"({page.chars_per_token:.2f} chars/token; normal is 1.5-2.7)")
             page.page_markdown = text
             for b in blocks:
                 if b.status == "pending":

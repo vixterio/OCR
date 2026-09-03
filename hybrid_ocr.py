@@ -570,6 +570,9 @@ class PageResult:
     # loop, leaked table markers, an imageprep correction that fired.
     notes: list[str] = field(default_factory=list)
     prep: dict = field(default_factory=dict)
+    # Characters of transcript per completion token. A model-independent symptom
+    # of a decode loop, whatever shape the repetition takes.
+    chars_per_token: float | None = None
 
     @property
     def incomplete(self) -> list[Block]:
