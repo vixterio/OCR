@@ -227,8 +227,15 @@ def main():
         print(f"transport http ({hybrid_ocr.SERVER_URL})")
 
         def vl_fn(image, prompt, max_tokens):
+            # spec.repetition_penalty must be passed HERE, not only in the copy
+            # of this function inside ocr_core: run_ocr builds the transport and
+            # hands its own vl_fn to process_page, so the one there is a fallback
+            # that never runs for a normal invocation. Wiring only that copy left
+            # Qwen looping exactly as if the penalty were unset -- 3,072 tokens
+            # and 730 repeated empty lines, byte-identical to no penalty at all.
             return hybrid_ocr.vl_read(image, "page", max_tokens, args.block_timeout,
-                                      True, prompt, model, spec.strip_patterns)
+                                      True, prompt, model, spec.strip_patterns,
+                                      getattr(spec, "repetition_penalty", None))
     else:
         import vl_client
         # The worker holds one model and serialises requests behind a lock, so

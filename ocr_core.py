@@ -342,7 +342,8 @@ def process_page(page_img, page_index, eng, gpu_pool, spec, model, verify, args,
     if vl_fn is None:
         def vl_fn(image, prompt, max_tokens):
             return vl_read(image, "page", max_tokens, args.block_timeout, True,
-                           prompt, model, spec.strip_patterns)
+                           prompt, model, spec.strip_patterns,
+                           getattr(spec, "repetition_penalty", None))
 
     h, w = page_img.shape[:2]
     t0 = time.time()

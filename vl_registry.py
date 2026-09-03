@@ -34,6 +34,12 @@ class VLSpec:
     max_tokens_page: int = 4096
     max_tokens_line: int = 256
     max_pixels: int = 1024 * 28 * 28
+    # Sent to the server's OpenAIRequest when set. Per-family because it is a
+    # per-model judgement: a penalty stops a decode loop forming, but a clinical
+    # table legitimately repeats tokens ("mmol/l", "normal", "b.B.") line after
+    # line, so a value that rescues one model can suppress real content in
+    # another. None means the parameter is not sent at all.
+    repetition_penalty: float | None = None
     strip_patterns: tuple = ()
     # 'http' = mlx-vlm OpenAI server (gives per-token logprobs, so the vote gets
     # real VL confidence). 'worker' = persistent subprocess, required for models
@@ -122,8 +128,21 @@ QWEN = VLSpec(
                  "transcription."),
     line_prompt=("Transcribe the text in this image exactly as printed. Output only "
                  "the text, with no commentary."),
-    max_tokens_page=8192,
+    # 3072, not 8192. Measured across two independent corpora: the most any
+    # non-looping Qwen page ever needed was 2,027 completion tokens (median
+    # ~1,000; mean 737 on the source documents), while both observed loops ran
+    # straight to the 8,192 ceiling. The KV cache grows with generated length, so
+    # that ceiling was also the peak memory -- which is what killed two runs at
+    # 8-9% free. This keeps 1.5x headroom over the largest real page and bounds a
+    # loop to 37% of the tokens, and so of the memory, it could previously claim.
+    max_tokens_page=3072,
     max_tokens_line=128,
+    # Mild on purpose. The failure is a decode loop -- 1,000 copies of
+    # "| | | | | |" -- and a small penalty is enough to break one, while a large
+    # one would start suppressing the genuinely repetitive content of a lab
+    # table. The transcript collapse stays as the backstop for a loop that forms
+    # anyway; this tries to stop it forming, which is what saves the memory.
+    repetition_penalty=1.05,
     # A general VLM may prepend chatter despite the instruction.
     strip_patterns=(r"^\s*(?:Here(?:'s| is)[^\n:]*:|```(?:markdown)?|```)\s*$",),
     notes=("A general-purpose instruction-following VLM rather than an OCR model. "

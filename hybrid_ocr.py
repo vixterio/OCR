@@ -170,7 +170,8 @@ class VLReply:
 def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
             timeout: int = 300, require_logprobs: bool = True,
             prompt: str | None = None, model: str | None = None,
-            strip_patterns: tuple = ()) -> VLReply:
+            strip_patterns: tuple = (),
+            repetition_penalty: float | None = None) -> VLReply:
     """Transcribe one crop. Raises VLError if the backend breaks the contract.
 
     Two silent failures are deliberately made loud here. A per-token entry with no
@@ -195,6 +196,10 @@ def vl_read(image_bgr, label: str = "text", max_tokens: int = 4096,
         "temperature": 0.0,
         "logprobs": True,
     }
+    if repetition_penalty is not None:
+        # Only sent when a family asks for it, so a server that does not accept
+        # the field never sees it.
+        payload["repetition_penalty"] = repetition_penalty
     req = urllib.request.Request(
         f"{SERVER_URL}/chat/completions",
         data=json.dumps(payload).encode(),
