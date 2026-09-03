@@ -163,10 +163,14 @@ Two changes cut the work substantially, and both are on by default:
   to re-read text the OCR engines had read twice already. Measured effect on
   `deepseek+ocr`: 334s to 124s wall. Force it back on with `--vl-line-reads`.
 
-**DeepSeek-OCR-2 needs `nice 0`.** It fails with a Metal command-buffer timeout at
-`nice 5` and `nice 10`, and it is the largest model here, so it can only run by
-taking the whole machine. On a fanless Air, prefer the other five modes and run
-DeepSeek on a bigger host. `run_ocr.py` warns if you start it at reduced priority.
+**DeepSeek-OCR-2 is withdrawn on 8 GB.** Its two modes are commented out in
+`vl_registry.py` -- uncomment both lines to reinstate on larger hardware, where
+nothing else needs changing. Measured reason on 20 pages: 25 worker restarts,
+pages 5 and 10 lost outright, worst content recall of the four families at
+85.8%, and the machine driven to 1% free memory. `deepseek+ocr` could not
+complete at all; it starved the machine until WindowServer was killed, and on
+retry managed 1 page of 20 in fifty minutes. It also needs `nice 0`: it fails
+with a Metal command-buffer timeout at reduced priority.
 
 ## Known limits
 
@@ -174,7 +178,93 @@ DeepSeek on a bigger host. `run_ocr.py` warns if you start it at reduced priorit
   the VL model alone and is marked with a dashed underline.
 - **Handwriting is never transcribed.** Regions labelled as handwriting,
   signature, seal or stamp are quarantined and shown as placeholders.
-- **No ground-truth evaluation exists yet.** There is no measured silent-error
-  rate, so treat flag counts as relative, not absolute.
+- **Ground truth now exists.** Three harnesses, below. Flag counts are still
+  relative, but recall and precision are measured.
 - 8 GB is tight. Peak is ~1.3 GB per page plus the VL server; the watchdog
   protects the machine but will stop a run if the system is already thrashing.
+
+
+## Measuring accuracy
+
+Three harnesses, because there are three kinds of ground truth available and
+they answer different questions.
+
+**`evaluate.py`** — the synthetic fixtures. `make_fixture.py` draws them from
+literal strings, so the exact set of numbers on each page is known.
+
+```bash
+.venv/bin/python evaluate.py output/*/audit.json --table
+```
+
+**`score_bundle.py`** — the shuffled bundles. Every page carries an embedded
+text layer, which is what the generator drew, so rendering and OCRing it is a
+closed experiment. Adds PII-field recovery and footer recovery from the
+manifests.
+
+```bash
+.venv/bin/python score_bundle.py output/b1/*/audit.json --table --rate 0.30
+```
+
+**`compare_html.py`** — the generator's own documents, against the HTML they
+were rendered from. This is the strongest comparison available and the one to
+prefer.
+
+```bash
+.venv/bin/python index_source_docs.py --cases 001 002 003 \
+    --types hausarztbrief laborbefund --outdir work/r1
+ROUND=work/r1 OUT=work/out/r1 MODES="granite paddle qwen" ./run_round.sh
+.venv/bin/python compare_html.py work/out/r1 --round work/r1 --side-by-side
+```
+
+`--side-by-side` writes one openable page per document, source on the left and
+the transcript on the right, which is what you want for reading the difference
+rather than scoring it.
+
+**Pair documents by patient name, never by case id.** The two corpora supplied
+with this project are separate generation runs whose ids collide: 45 of 50
+source cases carry a different patient under the same id, and even the 5 that
+match by name have different institutions and content. Measured number overlap
+between a source HTML and the corresponding bundle page was ~50%, against 100%
+between that HTML and its own PDF. Grading across corpora reports a
+catastrophic OCR failure that is entirely an artefact.
+
+## Making harder inputs
+
+Real scans are harder than born-digital renders, and the clean fixtures
+saturate — seven of eleven configurations scored 100% on them.
+
+```bash
+.venv/bin/python degrade.py euro_table_sample.png --all      # resolution, JPEG, skew, speckle, blur
+.venv/bin/python scanify.py merged_bundles/bundle_001.pdf --level medium
+.venv/bin/python probe_cpu.py fixtures/euro_table_*.png      # CPU engines only, no GPU, seconds
+```
+
+`scanify.py` writes an image-only PDF, so `pdf_input` takes its genuine scan
+path. Ground truth is unaffected: the degradations are pure image transforms of
+the same render, and the scorers map a scanned copy back to the original.
+
+## Image preprocessing
+
+`imageprep.py` probes each page and applies only what the measurement justifies.
+
+| | |
+|---|---|
+| always | probe, skew estimation, content-box crop |
+| conditional | deskew rotation, background division, CLAHE, 3x3 median |
+| never | any binarisation, fastNlMeansDenoising, whole-page deconvolution |
+
+The never-list is measured. Binarisation does not erase strokes — recall stays
+above 99% for Otsu, Sauvola and adaptive — it collapses precision to 27-46% by
+promoting speckle into ink. `fastNlMeansDenoising` costs 1.76 s/page, 17% of
+Granite's whole budget, and does not fix it.
+
+The probe costs 79-96 ms on an A4 page at 300 dpi. `--no-imageprep` disables it,
+`--no-deskew` measures skew and reports it without rotating.
+
+## Tests
+
+```bash
+.venv/bin/python test_numeric.py   # 92 checks: separators, units, identifiers, comparators
+.venv/bin/python test_vote.py      # 17 checks: family consensus, margins, unanimity
+.venv/bin/python test_loops.py     # 17 checks: the three decode-loop shapes
+```
